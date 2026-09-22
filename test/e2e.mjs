@@ -5,7 +5,7 @@
  * 用法: node test/e2e.mjs [--base http://127.0.0.1:8189] [--token 共享token]
  *                        [--steps 12] [--keep]
  *
- * 共享 token 取 --token、COMFYUI_API_TOKEN，或 deploy/comfyui/.env。
+ * 共享 token 取 --token、COMFYUI_API_TOKEN，或仓库根 .env（已在 .gitignore）。
  * 会生成真图（约 20s/张），结束时删掉临时凭据与图片（--keep 保留）。
  */
 
@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(HERE, '..', 'bin', 'comfyui.js');
-const ENV_FILE = path.join(HERE, '..', '..', '.env');
+const ENV_FILE = path.join(HERE, '..', '.env');
 
 function parseArgs(argv) {
   const opts = { base: 'http://127.0.0.1:8189', token: '', steps: 12, keep: false };
@@ -46,7 +46,7 @@ function sharedToken() {
     const line = fs.readFileSync(ENV_FILE, 'utf8').split('\n').find((l) => l.startsWith('COMFYUI_API_TOKEN='));
     if (line) return line.split('=')[1].trim();
   }
-  throw new Error('缺少共享 token：用 --token 传入，或设置 COMFYUI_API_TOKEN / deploy/comfyui/.env');
+  throw new Error('缺少共享 token：用 --token 传入，或设置 COMFYUI_API_TOKEN / 仓库根 .env');
 }
 
 const TOKEN = sharedToken();

@@ -1,0 +1,5 @@
+node_modules/
+.env
+comfyui-out/
+*.tgz
+.playwright-cli/

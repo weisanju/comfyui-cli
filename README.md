@@ -3,15 +3,22 @@
 ComfyUI 远程出图的命令行客户端。零运行时依赖（Node ≥ 22.5 内置 `fetch` 与 `parseArgs`），
 通过 **OAuth 设备码（两段审批）** 登录一次，token 存在本机用户目录，之后所有命令自动带上。
 
-- 服务端：`https://comfyui-api.weisanju.fun`（自托管封装层，见上级 `README.md`）
-- 模型：Qwen-Image-2.1 GGUF（AMD RX 7900 XTX），提交工作流 → 轮询 → 下载图片
+- 面向 `comfyui-api`——ComfyUI 之上的 Bearer/OAuth 队列封装层（服务端不随本仓库开源）
+- 参考部署：`https://comfyui-api.weisanju.fun`（内置为默认地址；登录要服务方审批，
+  连别的部署用 `--url` / `COMFYUI_CLI_URL`）
+- 典型链路：提交工作流 → 轮询 → 下载图片
 
 ## 安装
 
 ```bash
-npm install -g comfyui-cli          # 发布后
-# 或从本仓库（源码即时生效）：
-cd deploy/comfyui/cli && npm link
+npm install -g comfyui-cli
+```
+
+从源码（改动即时生效）：
+
+```bash
+git clone https://github.com/weisanju/comfyui-cli.git
+cd comfyui-cli && npm link
 ```
 
 ## 快速开始
@@ -35,15 +42,15 @@ comfyui logout [--all]         # 吊销当前 token 并删除本地凭据；--al
 
 登录是**两段审批**，任何人都能发起（服务端对申请设备码按 IP 限流 10s 一次）：
 
-1. **注册审批**：新机器要由持有 access code 的人批准一次。CLI 会打印**注册审批页**链接，
-   把它连同设备码发给服务方；对方在页面上填 access code（= 服务方的共享 token，见
-   `deploy/comfyui/.env`）批一下，浏览器自动 303 跳到设备授权页
+1. **注册审批**：新机器要由持有 access code（= 服务方的共享 token）的人批准一次。CLI 会打印
+   **注册审批页**链接，把它连同设备码发给服务方；对方在页面上填 access code 批一下，
+   浏览器自动 303 跳到设备授权页；已在册的机器打开这一页也直接送过去
 2. **设备授权**：发起登录的人自己确认设备码即可，不再要 access code
 
 机器按**指纹**记住（`~/.config/comfyui/machine.json`，随机 32 位 hex，0600；服务端存
 SQLite 的 `clients` 表），批过一次后再次登录直接进第二段——终端会提示「这台机器已经登记过」。
-删掉 machine.json 等于换了台机器，要重新走注册审批；服务方也可用
-`invoke clients --action forget --client-id <指纹>` 让它失忆。
+删掉 machine.json 等于换了台机器，要重新走注册审批；服务方也能在管理端
+（`DELETE /v1/clients/{指纹}`）让它失忆。
 
 - 凭据文件：`~/.config/comfyui/auth.json`（目录 0700，文件 0600），
   按服务地址存 token；`--url` 指定哪个服务就用哪条。
@@ -79,7 +86,7 @@ comfyui update --registry https://registry.npmmirror.com   # 换镜像源查版�
   > `https://registry.npmjs.org`；安装命令按自身的安装方式选：
   npm / pnpm / yarn 全局装的分别用对应包管理器装回同一位置
   （npm/pnpm 追加 `--registry`，yarn 走 `YARN_REGISTRY` 环境变量）。
-- 从仓库 `npm link` 的开发副本只提示、不动手（想强制装到全局加 `--force`）。
+- 从源码 `npm link` 的开发副本只提示、不动手（想强制装到全局加 `--force`）。
 - `--json` 输出 `current` / `latest` / `update_available` / `install_kind` / `registry` /
   `action` / `command`。
 
@@ -164,10 +171,25 @@ Qwen 系是 `prompt`/`negative_prompt`），所以内置模板与自带工作流
 ## 开发
 
 ```bash
-node --test "test/*.test.js"    # 单元测试（不起服务，55 项）
-npm run e2e                     # 端到端（要 API 在跑：两段审批登录 → 出图 → 分享链接 → 吊销 → 同机器再登录）
-node --test test/unit.test.js   # 单个文件
+npm link                        # 把 comfyui 挂到 PATH（改动源码即时生效）
+node --test "test/*.test.js"    # 单元测试（55 项，不起服务）
+npm run e2e                     # 端到端：两段审批登录 → 出图 → 分享链接 → 吊销 → 再登录
 ```
 
-`test/e2e.mjs` 需要一个共享 token 来**代批注册审批**：`--token` > `COMFYUI_API_TOKEN` >
-`../../.env`（即 `deploy/comfyui/.env`）；会自动在临时目录里走完两段审批，不会动你的真实凭据。
+`test/e2e.mjs` 需要一个在跑的 `comfyui-api` 及其**共享 token**（用来代批注册审批）：
+取 `--token` > `COMFYUI_API_TOKEN` > 仓库根 `.env`（`COMFYUI_API_TOKEN=…`，已在 .gitignore）。
+它在临时目录里走完两段审批、结束即删，不会动你的真实凭据；默认打
+`http://127.0.0.1:8189`，验证公网链路加 `--base https://…`。
+
+## 发布
+
+```bash
+npm pack --dry-run     # 预览包内容
+npm version patch      # 或 minor / major
+git push --follow-tags
+npm publish
+```
+
+## License
+
+MIT
