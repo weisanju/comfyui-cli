@@ -21,6 +21,7 @@ process.env.COMFYUI_CLI_CONFIG_DIR = emptyCfg;
 
 const { ApiError, UsageError, createClient } = await import('../src/api.js');
 const auth = await import('../src/auth.js');
+const { sniffImage } = await import('../src/image.js');
 const update = await import('../src/update.js');
 const wf = await import('../src/workflow.js');
 
@@ -214,6 +215,61 @@ describe('workflow: buildOverrides', () => {
   });
 });
 
+describe('image: 参考图预检（只看魔数）', () => {
+  const pad = (head, total = 32) => Buffer.concat([Buffer.from(head), Buffer.alloc(total - head.length)]);
+
+  it('认 PNG / JPEG / WebP', () => {
+    assert.deepEqual(sniffImage(pad([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), {
+      format: 'png',
+      ext: '.png',
+      mime: 'image/png',
+    });
+    assert.equal(sniffImage(pad([0xff, 0xd8, 0xff, 0xe0])).mime, 'image/jpeg');
+    const webp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(8)]);
+    assert.equal(sniffImage(webp).format, 'webp');
+  });
+
+  it('其它格式/短字节/非 Buffer → null', () => {
+    assert.equal(sniffImage(pad([0x47, 0x49, 0x46, 0x38, 0x39, 0x61])), null); // GIF
+    assert.equal(sniffImage(Buffer.from('just some text, long enough')), null);
+    assert.equal(sniffImage(Buffer.from([0x89, 0x50])), null);
+    assert.equal(sniffImage('not a buffer'), null);
+    assert.equal(sniffImage(undefined), null);
+  });
+
+  it('RIFF 但不是 WebP → null', () => {
+    const wav = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(8)]);
+    assert.equal(sniffImage(wav), null);
+  });
+});
+
+describe('workflow: --resolution 定位', () => {
+  it('优先挑 TextEncode 上的 resolution（Qwen 系）', () => {
+    const graph = structuredClone(QWEN_GRAPH);
+    graph['9'] = { class_type: 'SomeLatentNode', inputs: { resolution: 512 } };
+    assert.equal(wf.findResolutionNode(graph)[0], '4');
+  });
+
+  it('没有 TextEncode 时退到任何带 resolution 的节点', () => {
+    const graph = { 1: { class_type: 'EmptyLatentImage', inputs: { resolution: 512 } } };
+    assert.equal(wf.findResolutionNode(graph)[0], '1');
+  });
+
+  it('都没有 → null，buildOverrides 报用法错误', () => {
+    assert.equal(wf.findResolutionNode(GRAPH), null);
+    assert.throws(
+      () => wf.buildOverrides(GRAPH, { resolution: 0 }),
+      (e) => e instanceof UsageError && /--set/.test(e.message),
+    );
+  });
+
+  it('写进 TextEncode 节点的 resolution，0 也照写', () => {
+    const { overrides, notes } = wf.buildOverrides(QWEN_GRAPH, { resolution: 0 });
+    assert.equal(overrides['4'].resolution, 0);
+    assert.equal(notes.length, 1);
+  });
+});
+
 describe('auth: 凭据文件', () => {
   it('写入 0600、读回、覆盖与删除', () => {
     process.env.COMFYUI_CLI_CONFIG_DIR = credsCfg;
@@ -357,6 +413,38 @@ describe('api: HTTP 客户端', () => {
     assert.equal(res.body.length, 4);
   });
 
+  it('upload 发裸字节（不套 multipart），Content-Type 走头', async () => {
+    let captured = null;
+    const up = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        captured = {
+          method: req.method,
+          url: req.url,
+          type: req.headers['content-type'],
+          auth: req.headers.authorization,
+          body: Buffer.concat(chunks),
+        };
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ file_id: 'f1', width: 8, height: 8, bytes: 3, format: 'webp' }));
+      });
+    });
+    await new Promise((resolve) => up.listen(0, '127.0.0.1', resolve));
+    try {
+      const client = createClient({ baseUrl: `http://127.0.0.1:${up.address().port}`, token: 'comfyui_t' });
+      const data = await client.upload('/v1/uploads?name=a.webp', Buffer.from([1, 2, 3]), 'image/webp');
+      assert.equal(data.file_id, 'f1');
+      assert.equal(captured.method, 'POST');
+      assert.equal(captured.url, '/v1/uploads?name=a.webp');
+      assert.equal(captured.type, 'image/webp');
+      assert.equal(captured.auth, 'Bearer comfyui_t');
+      assert.deepEqual([...captured.body], [1, 2, 3]);
+    } finally {
+      up.close();
+    }
+  });
+
   it('连不上时报中文网络错误', async () => {
     const closed = http.createServer();
     await new Promise((resolve) => closed.listen(0, '127.0.0.1', resolve));
@@ -490,6 +578,131 @@ describe('cli: 退出码与提示', () => {
       );
       assert.match(stdout, /不等结果/);
       assert.equal(polls.length, 0);
+    } finally {
+      srv.close();
+    }
+  });
+
+  it('--image 的几种用法错误都退出码 2（不碰网络）', async () => {
+    const dir = path.join(tmpRoot, 'ref-usage');
+    fs.mkdirSync(dir, { recursive: true });
+    const notImage = path.join(dir, 'note.txt');
+    fs.writeFileSync(notImage, '这不是图片');
+    const fakePng = path.join(dir, 'a.png');
+    fs.writeFileSync(fakePng, Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(20)]));
+
+    const size = await runCli('generate', '-t', 'tpl', '--size', '1024x1024', '--image', fakePng);
+    assert.equal(size.code, 2);
+    assert.match(size.stderr, /--size 与 --image 不能同时用/);
+
+    const alone = await runCli('generate', '-t', 'tpl', '--resolution', '0');
+    assert.equal(alone.code, 2);
+    assert.match(alone.stderr, /--resolution 需要与 --image 一起用/);
+
+    const many = await runCli('generate', '-t', 'tpl', '--image', fakePng, '--image', fakePng);
+    assert.equal(many.code, 2);
+    assert.match(many.stderr, /--image 一次只支持 1 张/);
+
+    const badFormat = await runCli('generate', '-t', 'tpl', '--image', notImage);
+    assert.equal(badFormat.code, 2);
+    assert.match(badFormat.stderr, /参考图格式不支持/);
+
+    const missing = await runCli('generate', '-t', 'tpl', '--image', path.join(dir, 'nope.png'));
+    assert.equal(missing.code, 2);
+    assert.match(missing.stderr, /读不到参考图/);
+
+    const outOfRange = await runCli('generate', '-t', 'tpl', '--image', fakePng, '--resolution', '9999');
+    assert.equal(outOfRange.code, 2);
+    assert.match(outOfRange.stderr, /--resolution 超出范围/);
+  });
+
+  it('--image：先上传拿 file_id，再带 inputs 提交', async () => {
+    const dir = path.join(tmpRoot, 'ref-flow');
+    fs.mkdirSync(dir, { recursive: true });
+    const refPath = path.join(dir, '狐狸.png');
+    const refPng = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(24),
+    ]);
+    fs.writeFileSync(refPath, refPng);
+
+    const seen = [];
+    const srv = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        seen.push({
+          method: req.method,
+          url: req.url,
+          type: req.headers['content-type'] || '',
+          body: Buffer.concat(chunks),
+        });
+        res.setHeader('content-type', 'application/json');
+        if (req.url.startsWith('/v1/uploads')) {
+          res.writeHead(201);
+          res.end(JSON.stringify({ file_id: 'f-1', name: '狐狸.png', width: 32, height: 32, bytes: refPng.length, format: 'png' }));
+        } else if (req.url === '/v1/workflows/qwen-ref') {
+          res.writeHead(200);
+          res.end(JSON.stringify({ workflow: QWEN_GRAPH }));
+        } else if (req.method === 'POST' && req.url === '/v1/jobs') {
+          res.writeHead(202);
+          res.end(JSON.stringify({ job_id: 'j9', status: 'queued', queue_position: 1, source: 'qwen-ref' }));
+        } else {
+          res.writeHead(200);
+          res.end(JSON.stringify({ job_id: 'j9', status: 'completed', elapsed_s: 1, images: [] }));
+        }
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [CLI, 'generate', '-t', 'qwen-ref', '--image', refPath, '--resolution', '0', '--json', '--out', path.join(tmpRoot, 'ref-flow-out'), '--url', url, '--token', 'comfyui_t'],
+        { env, timeout: 8000 },
+      );
+      const upload = seen.find((r) => r.url.startsWith('/v1/uploads'));
+      assert.equal(upload.method, 'POST');
+      assert.equal(upload.type, 'image/png');
+      assert.match(upload.url, /name=%E7%8B%90%E7%8B%B8\.png/);
+      assert.equal(upload.body.length, refPng.length);
+
+      const job = seen.find((r) => r.url === '/v1/jobs');
+      const payload = JSON.parse(job.body.toString());
+      assert.deepEqual(payload.inputs, { image_1: 'f-1' });
+      assert.equal(payload.workflow_name, 'qwen-ref');
+      assert.equal(payload.overrides['4'].resolution, 0);
+
+      const result = JSON.parse(stdout);
+      assert.deepEqual(result.reference, { file_id: 'f-1', width: 32, height: 32, bytes: refPng.length });
+    } finally {
+      srv.close();
+    }
+  });
+
+  it('--image 上传的服务端报错原样透出（退出码 1）', async () => {
+    const dir = path.join(tmpRoot, 'ref-deny');
+    fs.mkdirSync(dir, { recursive: true });
+    const refPath = path.join(dir, 'b.png');
+    fs.writeFileSync(
+      refPath,
+      Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24)]),
+    );
+    const srv = http.createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/v1/workflows/qwen-ref') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ workflow: QWEN_GRAPH }));
+      } else {
+        res.writeHead(413);
+        res.end(JSON.stringify({ detail: '参考图超过 10 MB 上限' }));
+      }
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    try {
+      const r = await runCliWith(env, 'generate', '-t', 'qwen-ref', '--image', refPath, '--url', `http://127.0.0.1:${srv.address().port}`, '--token', 'comfyui_t');
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /参考图超过 10 MB 上限/);
     } finally {
       srv.close();
     }

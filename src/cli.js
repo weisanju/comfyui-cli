@@ -21,6 +21,7 @@ import {
   resolveUrl,
   saveCredential,
 } from './auth.js';
+import { sniffImage } from './image.js';
 import {
   PKG_NAME,
   compareVersions,
@@ -43,6 +44,7 @@ import {
 const EXIT = { OK: 0, ERROR: 1, USAGE: 2, JOB_FAILED: 3 };
 const POLL_MS = 2000;
 const WAIT_LIMIT_MS = 3 * 3600 * 1000;
+const MAX_REF_BYTES = 10 * 1024 * 1024;
 
 const out = (text = '') => process.stdout.write(`${text}\n`);
 const err = (text = '') => process.stderr.write(`${text}\n`);
@@ -94,6 +96,10 @@ generate 选项
       --prompt <文本>       正面提示词       --negative <文本>   负面提示词
       --steps <N>           采样步数         --cfg <N>           CFG
       --size <宽x高>        如 1024x1024     --seed <N>          随机种子（random 或负数 = 随机）
+      --image <文件>        参考图（图生图）：先上传拿 file_id 再提交；PNG/JPEG/WebP，
+                             ≤10MB，一次 1 张，提示词里可用 <image1> 指代它
+      --resolution <N>      参考图缩放到约 NxN 像素（保持比例、取 32 倍数），出图即此尺寸；
+                            0 = 保持参考图自身尺寸（须与 --image 同用）
       --set <节点id.输入=值> 直接改任意节点输入，可重复
       --out <目录|文件>     图片保存位置（默认 ./comfyui-out/）
       --no-wait             提交后立即返回，不等待出图
@@ -111,6 +117,7 @@ generate 选项
 示例
   comfyui login --label 我的笔记本
   comfyui generate -t qwen-image-2.1-t2i-gguf-api --prompt "雪山下的木屋，清晨薄雾"
+  comfyui generate -t qwen-image-2.1-ref-gguf-api --image fox.png --prompt "让 <image1> 里的狐狸戴上针织帽"
   comfyui generate -w my.json --set 6.denoise=0.5 --out ./out/
   comfyui jobs --limit 5   /   comfyui jobs 3f2a… --cancel
 `;
@@ -501,6 +508,8 @@ async function cmdGenerate(argv) {
     cfg: { type: 'string' },
     size: { type: 'string' },
     seed: { type: 'string' },
+    image: { type: 'string', multiple: true },
+    resolution: { type: 'string' },
     set: { type: 'string', multiple: true },
     out: { type: 'string' },
     'no-wait': { type: 'boolean' },
@@ -511,12 +520,45 @@ async function cmdGenerate(argv) {
   if (!values.workflow && !values.template) {
     throw new UsageError('需要 -w/--workflow <文件> 或 -t/--template <名称>');
   }
+  const refFile = (values.image ?? [])[0];
+  if ((values.image ?? []).length > 1) {
+    throw new UsageError(`--image 一次只支持 1 张（收到 ${values.image.length} 张）`);
+  }
+  if (refFile && values.size !== undefined) {
+    throw new UsageError('--size 与 --image 不能同时用：参考图的尺寸交给 --resolution（0 = 保持参考图自身尺寸）');
+  }
+  if (values.resolution !== undefined && !refFile) {
+    throw new UsageError('--resolution 需要与 --image 一起用');
+  }
   const num = (name, raw) => {
     if (raw === undefined) return undefined;
     const n = Number(raw);
     if (!Number.isFinite(n)) throw new UsageError(`--${name} 需要数字（收到 ${raw}）`);
     return n;
   };
+  const resolution = num('resolution', values.resolution);
+  if (resolution !== undefined && (resolution < 0 || resolution > 4096)) {
+    throw new UsageError(`--resolution 超出范围（0~4096）：${values.resolution}`);
+  }
+  // 参考图先在本地挡一遍（读得到 / 认得格式 / 不超 10MB），都是用法错误，不碰网络
+  let refBytes = null;
+  let refKind = null;
+  if (refFile) {
+    try {
+      refBytes = fs.readFileSync(refFile);
+    } catch (e) {
+      throw new UsageError(`读不到参考图 ${refFile}：${e.message}`);
+    }
+    if (refBytes.length > MAX_REF_BYTES) {
+      throw new UsageError(
+        `参考图超过 ${MAX_REF_BYTES / 1024 / 1024} MB 上限：${refFile}（${(refBytes.length / 1024 / 1024).toFixed(1)} MB）`,
+      );
+    }
+    refKind = sniffImage(refBytes);
+    if (!refKind) {
+      throw new UsageError(`参考图格式不支持：${refFile}（按文件内容判断，只收 PNG / JPEG / WebP）`);
+    }
+  }
   let seed = values.seed === 'random' ? randomSeed() : num('seed', values.seed);
   if (seed !== undefined && seed < 0) seed = randomSeed();
 
@@ -547,19 +589,42 @@ async function cmdGenerate(argv) {
     cfg: num('cfg', values.cfg),
     size: values.size,
     seed,
+    resolution,
     set: values.set,
   });
+
+  // 先上传拿 file_id 再提交作业，作业里引用它
+  let reference = null;
+  if (refFile) {
+    const uploaded = await ctx.client.upload(
+      `/v1/uploads?name=${encodeURIComponent(path.basename(refFile))}`,
+      refBytes,
+      refKind.mime,
+    );
+    reference = {
+      file_id: uploaded.file_id,
+      width: uploaded.width,
+      height: uploaded.height,
+      bytes: uploaded.bytes,
+    };
+  }
+
   if (!values.json) {
     for (const note of notes) err(`  ${note}`);
     if (seed !== undefined) err(`  seed = ${seed}`);
+    if (reference) {
+      const mb = (reference.bytes / 1024 / 1024).toFixed(2);
+      err(`  参考图 → ${reference.file_id}（${reference.width}x${reference.height}，${mb} MB）`);
+    }
   }
 
   const payload = values.template
     ? { workflow_name: values.template.replace(/\.json$/, ''), overrides }
     : { workflow: applyOverrides(graph, overrides) };
+  if (reference) payload.inputs = { image_1: reference.file_id };
   const submitted = await ctx.client.post('/v1/jobs', { body: payload });
   if (values.json && values['no-wait']) {
-    out(JSON.stringify(submitted, null, 2));
+    out(JSON.stringify(reference ? { ...submitted, reference } : submitted, null, 2));
     return EXIT.OK;
   }
   if (!values.json) {
@@ -581,7 +646,13 @@ async function cmdGenerate(argv) {
   }
   const saved = await saveImages(ctx.client, job, values.out);
   if (values.json) {
-    out(JSON.stringify({ job_id: job.job_id, status: job.status, elapsed_s: job.elapsed_s, images: saved }, null, 2));
+    out(
+      JSON.stringify(
+        { job_id: job.job_id, status: job.status, elapsed_s: job.elapsed_s, images: saved, ...(reference ? { reference } : {}) },
+        null,
+        2,
+      ),
+    );
     return EXIT.OK;
   }
   out(`完成（${fmtDuration(job.elapsed_s)}），已保存 ${saved.length} 张：`);

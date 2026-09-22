@@ -7,6 +7,8 @@ ComfyUI 远程出图的命令行客户端。零运行时依赖（Node ≥ 22.5 �
 - 默认服务地址是**本机自托管** `http://127.0.0.1:8189`（0.1.4 起）；连远程部署用
   `--url` / `COMFYUI_CLI_URL`，例如参考部署 `https://comfyui-api.weisanju.fun`（登录要服务方审批）
 - 典型链路：提交工作流 → 轮询 → 下载图片
+- 支持**参考图（图生图）**：`--image <文件>` 会先把图传到服务端 `/v1/uploads` 换 `file_id`，
+  再提交作业引用它（`--resolution 0` = 出图保持参考图尺寸）
 
 ## 安装
 
@@ -31,6 +33,9 @@ comfyui login --url <你的服务地址> --label 我的笔记本     # 本机部
 # 终端打印设备码（如 4KPC-MKFK）与授权链接，并尝试打开浏览器
 comfyui generate -t qwen-image-2.1-t2i-gguf-api --prompt "雪山下的木屋，清晨薄雾" --steps 12
 # → comfyui-out/<job_id>-0.png
+
+comfyui generate -t qwen-image-2.1-ref-gguf-api --image ./cat.png --resolution 0 \
+  --prompt "把参考图变成水彩插画，保留构图" --steps 24      # 图生图
 ```
 
 ## 登录与凭据
@@ -68,7 +73,7 @@ SQLite 的 `clients` 表），批过一次后再次登录直接进第二段—�
 
 | 命令 | 说明 |
 |---|---|
-| `generate` | 提交工作流出图并等待结果 |
+| `generate` | 提交工作流出图并等待结果（`-t` 模板 / `-w` 工作流 / `--image` 参考图） |
 | `jobs [ID] [--limit N]` | 列出最近作业；给 ID 看详情；`--cancel` 取消 |
 | `share <job_id> [--ttl 1h]` | 给出图完成的作业签发**限时分享链接**（免鉴权下载，过期即失效） |
 | `stats` | 队列深度 / 当前作业 / 近 20 次平均耗时 |
@@ -121,6 +126,10 @@ comfyui share 8f3c1a02-… --ttl 2d --json        # 机器可读
 comfyui generate -t qwen-image-2.1-t2i-gguf-api \
   --prompt "民国女学生特写" --negative "模糊" --steps 24 --size 1024x1024 --seed 42
 
+# 图生图：参考图 + prompt（--resolution 0 = 出图保持参考图尺寸）
+comfyui generate -t qwen-image-2.1-ref-gguf-api --image ./cat.png --resolution 0 \
+  --prompt "把参考图变成水彩插画，保留构图" --steps 24
+
 # 自带工作流（ComfyUI 前端「导出（API格式）」的 JSON）
 comfyui generate -w my-workflow.json --set 6.denoise=0.5 --out ./out/
 
@@ -138,6 +147,8 @@ comfyui generate … --json
 | `--prompt` / `--negative` | 正面 / 负面提示词（按 `class_type` 找 TextEncode 节点，再按节点自己的输入名写入） |
 | `--steps N` / `--cfg N` | 采样步数 / CFG（找 KSampler） |
 | `--size 宽x高` | 如 `1024x1024`、`1024×768`（16~8192；模型侧建议取 32 的倍数） |
+| `--image <文件>` | 参考图（图生图）：1 张 PNG/JPEG/WebP，≤ 10 MB / 40 MP；与 `--size` 互斥 |
+| `--resolution N` | 配 `--image` 用：参考图缩放到约 NxN 像素（保持比例、取 32 倍数），出图即此尺寸；`0` = 保持参考图自身尺寸（默认 1024） |
 | `--seed N` | 随机种子，`random` 或负数 = 随机 |
 | `--set 节点id.输入=值` | 直接改任意节点输入，可重复；定位不到的参数用它兜底 |
 | `--out <目录\|文件>` | 图片保存位置（默认 `./comfyui-out/`） |
@@ -150,6 +161,15 @@ Qwen 系是 `prompt`/`negative_prompt`），所以内置模板与自带工作流
 用 `--set 4.prompt=…` 精确指定。`--set` 写不存在的输入名会直接报用法错误（列出可用输入），
 因为这类键 ComfyUI 会静默忽略、等于没生效。工作流必须是 API 格式，
 顶层带 `nodes` 数组的 UI 格式会被本地拦下并提示重新导出。
+
+参考图（`--image`）：先在本地读文件、按**字节魔数**认格式（不信扩展名），
+再裸字节传到服务端 `POST /v1/uploads`，拿到的 `file_id` 放进作业的 `inputs`——服务端负责把它
+写进工作流里第 N 个 `LoadImage` 节点的 `image`，所以自带工作流也能用（只要里面真有 `LoadImage`）。
+文件读不到 / 格式不在 PNG、JPEG、WebP 里 / 超过 10 MB 都是本地用法错误（退出码 2，不碰网络）；
+`--size` 与 `--image` 互斥，要指定尺寸用 `--resolution`（`0` = 跟参考图一样大）。非 `--json` 时
+stderr 会打印 `参考图 → <file_id>（WxH，X MB）`，`--json` 输出多一段
+`reference: {file_id, width, height, bytes}`。`file_id` 绑当前凭据（换 token 要重新上传），
+服务端默认保留 24 小时后清扫，作业提交后远端把它写进工作流副本、不影响随后被删。
 
 ## 环境变量
 
@@ -175,15 +195,16 @@ Qwen 系是 `prompt`/`negative_prompt`），所以内置模板与自带工作流
 
 ```bash
 npm link                        # 把 comfyui 挂到 PATH（改动源码即时生效）
-node --test "test/*.test.js"    # 单元测试（55 项，不起服务）
-npm run e2e                     # 端到端：两段审批登录 → 出图 → 分享链接 → 吊销 → 再登录
+node --test "test/*.test.js"    # 单元测试（66 项，不起服务）
+npm run e2e                     # 端到端：两段审批登录 → 文生图 → 图生图 → 分享链接 → 吊销 → 再登录
 ```
 
 `test/e2e.mjs` 需要一个在跑的 `comfyui-api` 及其**共享 token**（用来代批注册审批）：
 取 `--token` > `COMFYUI_API_TOKEN` > 仓库根 `.env`（`COMFYUI_API_TOKEN=…`，已在 .gitignore）。
 它在临时目录里走完两段审批、结束即删，不会动你的真实凭据；收尾还会把服务端这台临时机器的
 注册记录一并删掉（`DELETE /v1/clients/<指纹>`，跑挂了也会尽力清理）。默认打
-`http://127.0.0.1:8189`，验证公网链路加 `--base https://…`。
+`http://127.0.0.1:8189`，验证公网链路加 `--base https://…`。图生图那步会真出 2 张图；
+留给服务端一张上传的参考图，默认 24 小时内被服务内的清扫任务收走。
 
 ## 发布
 

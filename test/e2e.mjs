@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-/** CLI 端到端：两段审批登录（脚本代批注册 + 代确认设备）→ 出图落盘校验 → whoami/stats/jobs →
+/** CLI 端到端：两段审批登录（脚本代批注册 + 代确认设备）→ 出图落盘校验 →
+ * 参考图出图（上传拿 file_id，--resolution 0 保持参考图尺寸）→ whoami/stats/jobs →
  * 吊销 → 401 → 同一台机器再登录免注册审批 → 收尾忘掉这台机器的注册记录。
  *
  * 用法: node test/e2e.mjs [--base http://127.0.0.1:8189] [--token 共享token]
@@ -243,10 +244,12 @@ try {
   ok(tpl.code === 0 && templates.length > 0, 'templates 列出内置模板', templates.join(', '));
 
   title('[3] 出图（CLI 按 class_type 定位节点）');
+  const t2iTemplate = templates.find((t) => /t2i/.test(t));
+  ok(Boolean(t2iTemplate), '模板列表里有文生图模板', t2iTemplate || templates.join(', '));
   const gen = await cli([
     'generate',
     '-t',
-    templates[0],
+    t2iTemplate,
     '--prompt',
     'a red apple on a wooden table, soft daylight',
     '--negative',
@@ -254,7 +257,7 @@ try {
     '--steps',
     String(opts.steps),
     '--size',
-    '1024x1024',
+    '1024x768',
     '--seed',
     '424242',
     '--out',
@@ -266,8 +269,45 @@ try {
   ok(result.status === 'completed', '作业完成', `${result.elapsed_s}s`);
   ok(result.images.length === 1, '落盘 1 张图', result.images.map((i) => path.basename(i.path)).join(', '));
   const png = checkPng(result.images[0].path);
-  ok(png.width === 1024 && png.height === 1024, '图片尺寸符合 --size', `${png.width}x${png.height}`);
+  ok(png.width === 1024 && png.height === 768, '图片尺寸符合 --size', `${png.width}x${png.height}`);
   ok(png.unique > 16 && png.max - png.min > 32, '不是黑图/纯色', `唯一色=${png.unique} 极值=${png.min}..${png.max}`);
+
+  title('[3b] 参考图出图（先上传拿 file_id，--resolution 0 保持参考图尺寸）');
+  const refTemplate = templates.find((t) => /ref/.test(t));
+  ok(Boolean(refTemplate), '模板列表里有参考图模板', refTemplate || templates.join(', '));
+  const refGen = await cli([
+    'generate',
+    '-t',
+    refTemplate,
+    '--image',
+    result.images[0].path,
+    '--resolution',
+    '0',
+    '--prompt',
+    'turn this into a watercolor illustration, soft washes',
+    '--steps',
+    String(opts.steps),
+    '--seed',
+    '424243',
+    '--out',
+    outDir,
+    '--json',
+  ]);
+  ok(refGen.code === 0, '参考图 generate 成功', refGen.stderr.trim().split('\n').at(-1) || '');
+  const refResult = JSON.parse(refGen.stdout);
+  ok(
+    refResult.reference?.file_id && refResult.reference.width === 1024 && refResult.reference.height === 768,
+    '上传拿到的 file_id 与参考图尺寸都回传了',
+    `${refResult.reference?.file_id} ${refResult.reference?.width}x${refResult.reference?.height}`,
+  );
+  ok(refResult.status === 'completed', '图生图作业完成', `${refResult.elapsed_s}s`);
+  const refPng = checkPng(refResult.images[0].path);
+  ok(
+    refPng.width === 1024 && refPng.height === 768,
+    '出图尺寸正好等于参考图（非方形尺寸，排除按默认 1024 缩放）',
+    `${refPng.width}x${refPng.height}`,
+  );
+  ok(refPng.unique > 16 && refPng.max - refPng.min > 32, '不是黑图/纯色', `唯一色=${refPng.unique} 极值=${refPng.min}..${refPng.max}`);
 
   title('[4] 分享链接（免鉴权下载）');
   const share = await cli(['share', result.job_id, '--ttl', '10m', '--json']);

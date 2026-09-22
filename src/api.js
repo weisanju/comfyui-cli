@@ -36,13 +36,16 @@ function networkDetail(err, url) {
 export function createClient({ baseUrl, token = '', timeoutMs = 60_000 }) {
   const root = String(baseUrl).replace(/\/+$/, '');
 
-  async function send(path, { method = 'GET', body, form, timeoutMs: t } = {}) {
+  async function send(path, { method = 'GET', body, form, raw, contentType, timeoutMs: t } = {}) {
     const url = `${root}${path}`;
     const headers = { accept: 'application/json, */*' };
     let payload;
     if (form) {
       headers['content-type'] = 'application/x-www-form-urlencoded';
       payload = new URLSearchParams(form).toString();
+    } else if (raw !== undefined) {
+      headers['content-type'] = contentType || 'application/octet-stream';
+      payload = raw;
     } else if (body !== undefined) {
       headers['content-type'] = 'application/json';
       payload = JSON.stringify(body);
@@ -121,5 +124,8 @@ export function createClient({ baseUrl, token = '', timeoutMs = 60_000 }) {
     get: (path, opts) => send(path, { ...opts, method: 'GET' }),
     post: (path, opts) => send(path, { ...opts, method: 'POST' }),
     del: (path, opts) => send(path, { ...opts, method: 'DELETE' }),
+    // 裸字节上传：Content-Type 走头，不套 multipart
+    upload: (path, bytes, contentType, opts) =>
+      send(path, { ...opts, method: 'POST', raw: bytes, contentType, timeoutMs: opts?.timeoutMs ?? 120_000 }),
   };
 }

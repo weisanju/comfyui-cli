@@ -77,6 +77,18 @@ export function findLatent(graph) {
   );
 }
 
+// resolution 把参考图缩放到约 NxN 像素（0 = 保持参考图自身尺寸），Qwen 系挂在 TextEncode 上
+const RESOLUTION_RE = /TextEncode/i;
+
+export function findResolutionNode(graph) {
+  const has = ([, n]) => 'resolution' in (n.inputs ?? {});
+  return (
+    entries(graph).find((e) => has(e) && RESOLUTION_RE.test(e[1].class_type)) ??
+    entries(graph).find(has) ??
+    null
+  );
+}
+
 function seedNode(graph, sampler) {
   if (!sampler) return null;
   if ('seed' in (sampler[1].inputs ?? {}) || 'noise_seed' in (sampler[1].inputs ?? {})) {
@@ -181,6 +193,13 @@ export function buildOverrides(graph, opts = {}) {
     const { width, height } = parseSize(opts.size);
     put(overrides, latent[0], 'width', width, notes, 'size');
     put(overrides, latent[0], 'height', height, notes, 'size');
+  }
+  if (opts.resolution !== undefined) {
+    const target = findResolutionNode(graph);
+    if (!target) {
+      throw new UsageError('工作流里找不到带 resolution 的节点，请改用 --set 节点id.resolution=…');
+    }
+    put(overrides, target[0], 'resolution', opts.resolution, notes, 'resolution');
   }
   for (const item of opts.set ?? []) {
     const m = /^([^.=\s]+)\.([^.=\s]+)\s*=\s*(.*)$/s.exec(item);
