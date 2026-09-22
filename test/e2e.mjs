@@ -137,8 +137,8 @@ async function approveTwoStages(userCode) {
 }
 
 /** 解析 PNG 并检查不是黑图/纯色（与 api/smoke_test.mjs 同一套判据） */
-function checkPng(file) {
-  const buf = fs.readFileSync(file);
+function checkPng(fileOrBuf) {
+  const buf = Buffer.isBuffer(fileOrBuf) ? fileOrBuf : fs.readFileSync(fileOrBuf);
   assert.equal(buf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'PNG 签名不对');
   let offset = 8;
   let width = 0;
@@ -251,7 +251,18 @@ try {
   ok(png.width === 1024 && png.height === 1024, '图片尺寸符合 --size', `${png.width}x${png.height}`);
   ok(png.unique > 16 && png.max - png.min > 32, '不是黑图/纯色', `唯一色=${png.unique} 极值=${png.min}..${png.max}`);
 
-  title('[4] 作业与概览');
+  title('[4] 分享链接（免鉴权下载）');
+  const share = await cli(['share', result.job_id, '--ttl', '10m', '--json']);
+  const link = JSON.parse(share.stdout);
+  ok(share.code === 0 && link.expires_in === 600 && link.images.length === 1, 'share 签发限时链接', `${link.expires_in}s`);
+  const pub = await fetch(link.images[0].url).catch((e) => ({ status: 0, statusText: e.message }));
+  ok(pub.status === 200, '免鉴权按链接取图', `HTTP ${pub.status}`);
+  const shared = checkPng(Buffer.from(await pub.arrayBuffer()));
+  ok(shared.unique > 16 && shared.max - shared.min > 32, '分享图不是黑图/纯色', `唯一色=${shared.unique}`);
+  const tampered = await fetch(link.images[0].url.replace(/sig=[^&]+/, 'sig=nope'));
+  ok(tampered.status === 403, '改签名 → 403', `HTTP ${tampered.status}`);
+
+  title('[5] 作业与概览');
   const jobs = await cli(['jobs', '--limit', '3', '--json']);
   const list = JSON.parse(jobs.stdout);
   ok(jobs.code === 0 && list.jobs.some((j) => j.job_id === result.job_id), 'jobs 列表里有刚才的作业');
@@ -260,7 +271,7 @@ try {
   const stats = await cli(['stats']);
   ok(stats.code === 0 && /排队:/.test(stats.stdout), 'stats 可读');
 
-  title('[5] 退出与失效');
+  title('[6] 退出与失效');
   const logout = await cli(['logout']);
   ok(logout.code === 0 && /已吊销/.test(logout.stdout), 'logout 吊销设备 token', logout.stdout.trim());
   const after = await cli(['whoami', '--url', BASE, '--token', stored.access_token]);
@@ -269,7 +280,7 @@ try {
   ok(again.code === 2 && /comfyui login/.test(again.stderr), '本地凭据已清，提示重新登录');
   ok(!fs.existsSync(authPath) || Object.keys(JSON.parse(fs.readFileSync(authPath, 'utf8')).servers).length === 0, '凭据文件里已无该服务');
 
-  title('[6] 记住批过的机器');
+  title('[7] 记住批过的机器');
   const relogin = await loginThroughBrowser('e2e-again');
   ok(relogin.code === 0, '同一台机器再登录成功', `exit=${relogin.code}`);
   ok(/这台机器已经登记过，直接确认设备/.test(relogin.output), '跳过注册审批（服务端按机器指纹记住）');

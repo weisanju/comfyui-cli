@@ -27,6 +27,7 @@ import {
   installCommand,
   installKind,
   latestVersion,
+  registryOverride,
   registryUrl,
   runInstall,
 } from './update.js';
@@ -77,12 +78,14 @@ const HELP = `comfyui — ComfyUI 远程出图 CLI
 任务
   generate                  提交工作流出图（见下）
   jobs [ID] [--limit N]     列出最近作业；给 ID 看详情；--cancel 取消
+  share <job_id> [--ttl 1h] 给作业的图片签发限时分享链接（免鉴权下载，过期即失效）
   stats                     队列与耗时概览
   templates                 列出服务器内置模板
 
 其它
   skill [-o 文件]           取服务端 /SKILL.md 调用说明
-  update [--check] [--force]  把自己更新到 npm 最新版（--check 只看版本）
+  update [--check] [--force] [--registry URL]
+                            更新自己到 npm 最新版（--check 只看版本，--registry 换镜像源）
   help | --version
 
 generate 选项
@@ -455,6 +458,38 @@ async function cmdJobs(argv) {
   return job.status === 'failed' ? EXIT.JOB_FAILED : EXIT.OK;
 }
 
+const TTL_UNITS = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/** --ttl 接受纯秒数（3600）或带单位（90s / 30m / 2h / 1d）。 */
+function parseTtl(text) {
+  const m = /^(\d+)([smhd]?)$/i.exec(String(text).trim());
+  if (!m) throw new UsageError(`--ttl 不合法：${text}（用秒数或 90s / 30m / 2h / 1d）`);
+  const seconds = Number.parseInt(m[1], 10) * TTL_UNITS[(m[2] || 's').toLowerCase()];
+  if (seconds < 60) throw new UsageError('--ttl 最少 60 秒');
+  return seconds;
+}
+
+/** 给作业的图片签发限时分享链接：拿到链接的人免鉴权即可下载，过期自动失效。 */
+async function cmdShare(argv) {
+  const { values, positionals } = parse(argv, { ttl: { type: 'string' } });
+  const jobId = positionals[0];
+  if (!jobId) {
+    throw new UsageError('用法: comfyui share <job_id> [--ttl 1h|30m|3600] [--json]');
+  }
+  const ttl = values.ttl ? parseTtl(values.ttl) : undefined;
+  const ctx = context(values);
+  const data = await ctx.client.post(`/v1/jobs/${encodeURIComponent(jobId)}/share`, {
+    body: ttl ? { ttl } : {},
+  });
+  if (values.json) {
+    out(JSON.stringify(data, null, 2));
+    return EXIT.OK;
+  }
+  out(`分享链接（${fmtDuration(data.expires_in)}内有效，到期自动失效）：`);
+  for (const img of data.images) out(`  [${img.index}] ${img.url}`);
+  return EXIT.OK;
+}
+
 async function cmdGenerate(argv) {
   const { values } = parse(argv, {
     workflow: { type: 'string', short: 'w' },
@@ -615,22 +650,27 @@ async function cmdConfig(argv) {
 
 /** 把 CLI 自己更新到 npm 上的最新版；开发副本默认只提示不动手。 */
 async function cmdUpdate(argv) {
-  const { values } = parse(argv, { check: { type: 'boolean' }, force: { type: 'boolean' } });
+  const { values } = parse(argv, {
+    check: { type: 'boolean' },
+    force: { type: 'boolean' },
+    registry: { type: 'string' },
+  });
   const current = version();
-  const latest = await latestVersion();
+  const latest = await latestVersion(values.registry);
   const newer = compareVersions(latest, current) > 0;
   const kind = installKind();
+  const registry = registryOverride(values.registry);
   const info = {
     current,
     latest,
     update_available: newer,
     install_kind: kind,
-    registry: registryUrl(),
+    registry: registryUrl(values.registry),
     action: 'none',
     command: null,
   };
 
-  const [cmd, args] = installCommand(kind, latest);
+  const [cmd, args] = installCommand(kind, latest, registry);
   if (!newer) {
     info.action = 'none';
   } else if (values.check) {
@@ -641,7 +681,7 @@ async function cmdUpdate(argv) {
   } else {
     info.action = 'install';
     info.command = [cmd, ...args].join(' ');
-    await runInstall(kind, latest);
+    await runInstall(kind, latest, registry);
   }
 
   if (values.json) {
@@ -670,6 +710,7 @@ const COMMANDS = {
   templates: cmdTemplates,
   stats: cmdStats,
   jobs: cmdJobs,
+  share: cmdShare,
   generate: cmdGenerate,
   skill: cmdSkill,
   config: cmdConfig,

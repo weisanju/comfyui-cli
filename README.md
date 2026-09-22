@@ -60,10 +60,11 @@ SQLite 的 `clients` 表），批过一次后再次登录直接进第二段—�
 |---|---|
 | `generate` | 提交工作流出图并等待结果 |
 | `jobs [ID] [--limit N]` | 列出最近作业；给 ID 看详情；`--cancel` 取消 |
+| `share <job_id> [--ttl 1h]` | 给出图完成的作业签发**限时分享链接**（免鉴权下载，过期即失效） |
 | `stats` | 队列深度 / 当前作业 / 近 20 次平均耗时 |
 | `templates` | 列出服务端内置模板名 |
 | `skill [-o 文件]` | 取服务端 `/SKILL.md` 调用说明（丢给 AI 代理用） |
-| `update [--check] [--force]` | 把自己更新到 npm 上的最新版；`--check` 只看版本 |
+| `update [--check] [--force] [--registry URL]` | 把自己更新到 npm 上的最新版；`--check` 只看版本 |
 | `whoami` / `config` / `logout` | 见上 |
 
 ### update
@@ -71,12 +72,37 @@ SQLite 的 `clients` 表），批过一次后再次登录直接进第二段—�
 ```bash
 comfyui update --check      # 只报当前版本 / 最新版本，不动手
 comfyui update              # 有新版本就重新全局安装，没新版本直接退出
+comfyui update --registry https://registry.npmmirror.com   # 换镜像源查版本 + 重装
 ```
 
-- 版本取自 npm registry（`COMFYUI_CLI_REGISTRY` 可换成镜像），安装命令按自身的安装方式选：
-  npm / pnpm / yarn 全局装的分别用对应包管理器装回同一位置。
+- 版本取自 npm registry，查版本与重装用的是同一个源：`--registry` > `COMFYUI_CLI_REGISTRY`
+  > `https://registry.npmjs.org`；安装命令按自身的安装方式选：
+  npm / pnpm / yarn 全局装的分别用对应包管理器装回同一位置
+  （npm/pnpm 追加 `--registry`，yarn 走 `YARN_REGISTRY` 环境变量）。
 - 从仓库 `npm link` 的开发副本只提示、不动手（想强制装到全局加 `--force`）。
-- `--json` 输出 `current` / `latest` / `update_available` / `install_kind` / `action` / `command`。
+- `--json` 输出 `current` / `latest` / `update_available` / `install_kind` / `registry` /
+  `action` / `command`。
+
+### share
+
+```bash
+comfyui share 8f3c1a02-…                        # 默认 1 小时有效
+comfyui share 8f3c1a02-… --ttl 30m              # 半小时
+comfyui share 8f3c1a02-… --ttl 2d --json        # 机器可读
+```
+
+拿到链接的人**不需要 token**，浏览器直接打开就能看图 / 下载（`curl -O` 也行）：
+
+```
+分享链接（30m00s 内有效，到期自动失效）：
+  [0] https://comfyui-api.weisanju.fun/public/jobs/8f3c…/images/0?exp=1790088000&sig=…
+```
+
+- 链接带服务端 HMAC 签名与到期时间，**改一个字符就 403**，过期同样 403；
+  签名只覆盖「作业 + 第几张 + 到期时间」，别人拿到也只能下这一张，不能顺藤摸瓜看别的作业。
+- `--ttl` 接受纯秒数（`3600`）或带单位（`90s` / `30m` / `2h` / `1d`），最少 60 秒；
+  服务端把上限压到 7 天。默认值由服务端 `COMFYUI_API_SHARE_TTL` 决定（1 小时）。
+- 只能分享**已出图**的作业；作业还在排队/执行会报 400（先 `comfyui jobs <id>` 看状态）。
 
 ### generate
 
@@ -122,7 +148,7 @@ Qwen 系是 `prompt`/`negative_prompt`），所以内置模板与自带工作流
 | `COMFYUI_CLI_URL` | 服务地址（默认 `https://comfyui-api.weisanju.fun`） |
 | `COMFYUI_CLI_TOKEN` | 直接指定 token，跳过凭据文件（共享 token 或设备 token 都行） |
 | `COMFYUI_CLI_CONFIG_DIR` | 凭据与机器指纹目录（默认 `~/.config/comfyui`，测试用） |
-| `COMFYUI_CLI_REGISTRY` | `update` 查版本的 registry（默认 `https://registry.npmjs.org`，国内可换镜像） |
+| `COMFYUI_CLI_REGISTRY` | `update` 的 registry（默认 `https://registry.npmjs.org`，国内可换镜像；`--registry` 可临时覆盖） |
 
 优先级：命令行 `--url/--token` > 环境变量 > 凭据文件 > 内置默认地址。
 
@@ -138,8 +164,8 @@ Qwen 系是 `prompt`/`negative_prompt`），所以内置模板与自带工作流
 ## 开发
 
 ```bash
-node --test "test/*.test.js"    # 单元测试（不起服务，48 项）
-npm run e2e                     # 端到端（要 API 在跑：两段审批登录 → 出图 → 吊销 → 同机器再登录）
+node --test "test/*.test.js"    # 单元测试（不起服务，55 项）
+npm run e2e                     # 端到端（要 API 在跑：两段审批登录 → 出图 → 分享链接 → 吊销 → 同机器再登录）
 node --test test/unit.test.js   # 单个文件
 ```
 

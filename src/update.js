@@ -9,12 +9,17 @@ import { ApiError } from './api.js';
 export const PKG_NAME = 'comfyui-cli';
 const DEFAULT_REGISTRY = 'https://registry.npmjs.org';
 
-export function registryUrl() {
-  return (process.env.COMFYUI_CLI_REGISTRY || DEFAULT_REGISTRY).replace(/\/+$/, '');
+/** 显式指定的 registry（`--registry` > `COMFYUI_CLI_REGISTRY`），没指定返回空串。 */
+export function registryOverride(explicit) {
+  return (explicit?.trim() || process.env.COMFYUI_CLI_REGISTRY?.trim() || '').replace(/\/+$/, '');
 }
 
-export async function latestVersion() {
-  const url = `${registryUrl()}/${PKG_NAME}/latest`;
+export function registryUrl(explicit) {
+  return registryOverride(explicit) || DEFAULT_REGISTRY;
+}
+
+export async function latestVersion(explicit) {
+  const url = `${registryUrl(explicit)}/${PKG_NAME}/latest`;
   let res;
   try {
     res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
@@ -50,18 +55,21 @@ export function installKind() {
   return root.includes(`${path.sep}node_modules${path.sep}`) ? 'npm' : 'dev';
 }
 
-export function installCommand(kind, version) {
+export function installCommand(kind, version, registry) {
   const pkg = `${PKG_NAME}@${version}`;
-  if (kind === 'pnpm') return ['pnpm', ['add', '-g', pkg]];
+  const flag = registry ? ['--registry', registry] : [];
+  if (kind === 'pnpm') return ['pnpm', ['add', '-g', pkg, ...flag]];
+  // yarn 不支持 --registry，改由 runInstall 传 YARN_REGISTRY 环境变量
   if (kind === 'yarn') return ['yarn', ['global', 'add', pkg]];
-  return [process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '-g', pkg]];
+  return [process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '-g', pkg, ...flag]];
 }
 
 /** 跑安装命令，输出直接接到当前终端（npm 的进度、报错都看得到）。 */
-export function runInstall(kind, version) {
-  const [cmd, args] = installCommand(kind, version);
+export function runInstall(kind, version, registry) {
+  const [cmd, args] = installCommand(kind, version, registry);
+  const env = kind === 'yarn' && registry ? { ...process.env, YARN_REGISTRY: registry } : process.env;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: 'inherit' });
+    const child = spawn(cmd, args, { stdio: 'inherit', env });
     child.on('error', (e) => reject(new ApiError(0, `执行 ${cmd} 失败：${e.message}`)));
     child.on('close', (code) =>
       code === 0 ? resolve() : reject(new ApiError(0, `${cmd} ${args.join(' ')} 退出码 ${code}`)),

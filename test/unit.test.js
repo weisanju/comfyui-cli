@@ -578,10 +578,90 @@ describe('cli: 退出码与提示', () => {
   });
 });
 
+describe('share: 分享链接', () => {
+  const env = { ...process.env, COMFYUI_CLI_CONFIG_DIR: emptyCfg };
+  let srv;
+  let base;
+  const seen = [];
+
+  const PAYLOAD = {
+    job_id: 'j1',
+    expires_in: 1800,
+    expires_at: 1800000000,
+    images: [
+      { index: 0, filename: 'a_00001.png', url: 'https://api.example/public/jobs/j1/images/0?exp=1&sig=x' },
+      { index: 1, filename: 'a_00002.png', url: 'https://api.example/public/jobs/j1/images/1?exp=1&sig=y' },
+    ],
+  };
+
+  before(async () => {
+    srv = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => {
+        body += c;
+      });
+      req.on('end', () => {
+        seen.push({ method: req.method, url: req.url, body, auth: req.headers.authorization });
+        res.setHeader('content-type', 'application/json');
+        if (req.url === '/v1/jobs/j1/share') {
+          res.writeHead(200);
+          res.end(JSON.stringify(PAYLOAD));
+        } else if (req.url === '/v1/jobs/empty/share') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ detail: '作业还没有图片（出图完成后才能分享）' }));
+        } else {
+          res.writeHead(404);
+          res.end(JSON.stringify({ detail: '未知的 job_id（仅保留最近 200 条终结作业）' }));
+        }
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    base = `http://127.0.0.1:${srv.address().port}`;
+  });
+
+  after(() => srv?.close());
+
+  const runShare = (...args) => runCliWith(env, 'share', ...args, '--url', base, '--token', 'comfyui_t');
+
+  it('--ttl 30m 换算成秒发给服务端，打印每条链接', async () => {
+    const r = await runShare('j1', '--ttl', '30m');
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.at(-1).auth, 'Bearer comfyui_t');
+    assert.deepEqual(JSON.parse(seen.at(-1).body), { ttl: 1800 });
+    assert.match(r.stdout, /30m00s内有效/);
+    assert.match(r.stdout, /\[1\] https:\/\/api\.example\/public\/jobs\/j1\/images\/1\?exp=1&sig=y/);
+  });
+
+  it('不带 --ttl 就不传字段（用服务端默认）', async () => {
+    const r = await runShare('j1', '--json');
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(JSON.parse(seen.at(-1).body), {});
+    assert.equal(JSON.parse(r.stdout).images.length, 2);
+  });
+
+  it('缺 job_id / --ttl 不合法 / 低于 60 秒 → 2（用法错误）', async () => {
+    const missing = await runShare();
+    assert.equal(missing.code, 2);
+    assert.match(missing.stderr, /用法: comfyui share <job_id>/);
+    for (const bad of ['abc', '30', '30s', '2x']) {
+      const r = await runShare('j1', '--ttl', bad);
+      assert.equal(r.code, 2, `--ttl ${bad}`);
+      assert.match(r.stderr, /--ttl/);
+    }
+  });
+
+  it('作业还没出图 → 1 并原样带出服务端提示', async () => {
+    const r = await runShare('empty');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /作业还没有图片/);
+  });
+});
+
 describe('update: 自更新', () => {
   const pkgVersion = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8')).version;
   let srv;
   let registryVersion = '0.2.0';
+  let envRegistry;
   let npmLog;
   let env;
 
@@ -591,6 +671,7 @@ describe('update: 自更新', () => {
       res.end(JSON.stringify({ version: registryVersion }));
     });
     await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    envRegistry = `http://127.0.0.1:${srv.address().port}`;
     npmLog = path.join(tmpRoot, 'npm.log');
     const fakeBin = path.join(tmpRoot, 'fakebin');
     fs.mkdirSync(fakeBin, { recursive: true });
@@ -598,7 +679,7 @@ describe('update: 自更新', () => {
     env = {
       ...process.env,
       COMFYUI_CLI_CONFIG_DIR: emptyCfg,
-      COMFYUI_CLI_REGISTRY: `http://127.0.0.1:${srv.address().port}`,
+      COMFYUI_CLI_REGISTRY: envRegistry,
       NPM_LOG: npmLog,
       PATH: `${fakeBin}:${process.env.PATH}`,
     };
@@ -630,12 +711,13 @@ describe('update: 自更新', () => {
     assert.deepEqual(npmCalls(), []);
   });
 
-  it('--force 才真的调 npm 装指定版本', async () => {
+  it('--force 才真的调 npm 装指定版本（带上 registry）', async () => {
     const r = await runCliWith(env, 'update', '--json', '--force');
     const info = JSON.parse(r.stdout);
     assert.equal(info.action, 'install');
-    assert.equal(info.command, 'npm install -g comfyui-cli@0.2.0');
-    assert.deepEqual(npmCalls(), ['install -g comfyui-cli@0.2.0']);
+    assert.equal(info.registry, envRegistry);
+    assert.equal(info.command, `npm install -g comfyui-cli@0.2.0 --registry ${envRegistry}`);
+    assert.deepEqual(npmCalls(), [`install -g comfyui-cli@0.2.0 --registry ${envRegistry}`]);
   });
 
   it('registry 上就是当前版本 → 不装', async () => {
@@ -644,7 +726,7 @@ describe('update: 自更新', () => {
       const r = await runCliWith(env, 'update');
       assert.equal(r.code, 0);
       assert.match(r.stdout, new RegExp(`已是最新（${pkgVersion.replace(/\./g, '\\.')}）`));
-      assert.deepEqual(npmCalls(), ['install -g comfyui-cli@0.2.0']); // 还是上一条留下的那次
+      assert.deepEqual(npmCalls(), [`install -g comfyui-cli@0.2.0 --registry ${envRegistry}`]); // 还是上一条留下的那次
     } finally {
       registryVersion = '0.2.0';
     }
@@ -658,5 +740,52 @@ describe('update: 自更新', () => {
     const r = await runCliWith({ ...env, COMFYUI_CLI_REGISTRY: url }, 'update', '--check');
     assert.equal(r.code, 1);
     assert.match(r.stderr, /连不上 npm|请求失败/);
+  });
+
+  it('registry 归一化：去空格与尾斜杠，未指定时回落到官方源', () => {
+    assert.equal(update.registryOverride('  https://mirror.example//  '), 'https://mirror.example');
+    assert.equal(update.registryUrl('https://mirror.example/'), 'https://mirror.example');
+    const old = process.env.COMFYUI_CLI_REGISTRY;
+    delete process.env.COMFYUI_CLI_REGISTRY;
+    try {
+      assert.equal(update.registryOverride(''), '');
+      assert.equal(update.registryUrl(), 'https://registry.npmjs.org');
+    } finally {
+      if (old !== undefined) process.env.COMFYUI_CLI_REGISTRY = old;
+    }
+  });
+
+  it('installCommand 只在给了 registry 时追加 --registry', () => {
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    assert.deepEqual(update.installCommand('npm', '1.2.3'), [npm, ['install', '-g', 'comfyui-cli@1.2.3']]);
+    assert.deepEqual(update.installCommand('npm', '1.2.3', 'https://mirror.example'), [
+      npm,
+      ['install', '-g', 'comfyui-cli@1.2.3', '--registry', 'https://mirror.example'],
+    ]);
+    // yarn 不认 --registry，改走 YARN_REGISTRY 环境变量（见 runInstall）
+    assert.deepEqual(update.installCommand('yarn', '1.2.3', 'https://mirror.example'), [
+      'yarn',
+      ['global', 'add', 'comfyui-cli@1.2.3'],
+    ]);
+  });
+
+  it('--registry 覆盖环境变量且传给安装命令', async () => {
+    const other = http.createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: '0.3.0' }));
+    });
+    await new Promise((resolve) => other.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${other.address().port}`;
+    try {
+      const r = await runCliWith(env, 'update', '--json', '--force', '--registry', `${url}//`);
+      const info = JSON.parse(r.stdout);
+      assert.equal(r.code, 0);
+      assert.equal(info.latest, '0.3.0'); // 来自 --registry 那个源，不是 env 里的 0.2.0
+      assert.equal(info.registry, url);
+      assert.equal(info.command, `npm install -g comfyui-cli@0.3.0 --registry ${url}`);
+      assert.deepEqual(npmCalls().at(-1), `install -g comfyui-cli@0.3.0 --registry ${url}`);
+    } finally {
+      await new Promise((resolve) => other.close(resolve));
+    }
   });
 });
