@@ -110,6 +110,28 @@ function put(overrides, id, key, value, notes, label) {
   notes.push(`${label} → 节点 ${id}.${key} = ${JSON.stringify(value)}`);
 }
 
+// 提示词的输入名各节点类不一样：CLIPTextEncode 是 text，Qwen 系是 prompt / negative_prompt。
+// 只能从节点自己的 inputs 里挑——名字写错的键服务端会拒（ComfyUI 也会静默忽略）。
+const PROMPT_KEYS = ['text', 'prompt'];
+const NEGATIVE_KEYS = ['negative_prompt', 'negative_text', 'negative', 'text', 'prompt'];
+
+function pickInput(entry, candidates) {
+  const inputs = entry?.[1]?.inputs ?? {};
+  const key = candidates.find((name) => name in inputs);
+  return key ? { id: entry[0], key } : null;
+}
+
+function requireInput(entry, candidates, what) {
+  const hit = pickInput(entry, candidates);
+  if (hit) return hit;
+  const [id, node] = entry;
+  const available = Object.keys(node.inputs ?? {});
+  throw new UsageError(
+    `节点 ${id}（${node.class_type}）没有可写 ${what} 的输入（找过 ${candidates.join('/')}）；` +
+      `它的可用输入: ${available.join(', ') || '无'}，请改用 --set ${id}.<输入名>=…`,
+  );
+}
+
 /** 把命令行开关翻成 {节点id: {输入名: 值}}；找不到目标节点时报用法错误。 */
 export function buildOverrides(graph, opts = {}) {
   const overrides = {};
@@ -120,11 +142,19 @@ export function buildOverrides(graph, opts = {}) {
 
   if (opts.prompt !== undefined) {
     if (!positive) throw new UsageError('工作流里找不到提示词节点，请改用 --set 节点id.text=…');
-    put(overrides, positive[0], 'text', opts.prompt, notes, 'prompt');
+    const { id, key } = requireInput(positive, PROMPT_KEYS, 'prompt');
+    put(overrides, id, key, opts.prompt, notes, 'prompt');
   }
   if (opts.negative !== undefined) {
     if (!negative) throw new UsageError('工作流里找不到负面提示词节点，请改用 --set 节点id.text=…');
-    put(overrides, negative[0], 'text', opts.negative, notes, 'negative');
+    // 正负同一个节点时（Qwen 模板就是这样），别让 negative 覆盖掉正面提示词
+    const positiveKey = positive && positive[0] === negative[0] ? pickInput(positive, PROMPT_KEYS)?.key : null;
+    const { id, key } = requireInput(
+      negative,
+      NEGATIVE_KEYS.filter((name) => name !== positiveKey),
+      'negative',
+    );
+    put(overrides, id, key, opts.negative, notes, 'negative');
   }
   if (opts.steps !== undefined) {
     if (!sampler || !('steps' in (sampler[1].inputs ?? {}))) {
@@ -157,8 +187,13 @@ export function buildOverrides(graph, opts = {}) {
     if (!m) throw new UsageError(`--set 需要 节点id.输入名=值 形式（收到 ${item}）`);
     const [, id, key, raw] = m;
     if (!graph[id]) throw new UsageError(`--set 里的节点 ${id} 不在工作流中`);
+    const available = Object.keys(graph[id].inputs ?? {});
     if (!(key in (graph[id].inputs ?? {}))) {
-      notes.push(`（提示）节点 ${id} 原本没有输入 ${key}，仍按值写入`);
+      // 写不存在的输入名 ComfyUI 会静默忽略，等于这条 --set 没生效，不如直接拦下
+      throw new UsageError(
+        `--set 的输入 ${key} 不在节点 ${id}（${graph[id].class_type}）上；` +
+          `可用: ${available.join(', ') || '无'}`,
+      );
     }
     put(overrides, id, key, coerce(raw), notes, 'set');
   }

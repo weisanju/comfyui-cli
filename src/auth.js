@@ -1,5 +1,6 @@
 /** 凭据与设备码登录：token 存 ~/.config/comfyui/auth.json（0600），服务端只留 sha256。 */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,35 @@ export function configDir() {
 
 export function authFile() {
   return path.join(configDir(), 'auth.json');
+}
+
+export function machineFile() {
+  return path.join(configDir(), 'machine.json');
+}
+
+/**
+ * 机器指纹：随机生成一次、长期复用，服务端按它记住「这台机器批过注册审批」。
+ * 换 hostname、换凭据都不影响；删了这个文件等于换了台机器，要重新审批。
+ */
+export function machineIdentity() {
+  try {
+    const data = JSON.parse(fs.readFileSync(machineFile(), 'utf8'));
+    if (data?.id) {
+      return { id: String(data.id), hostname: os.hostname(), platform: process.platform };
+    }
+  } catch {
+    /* 没写过或写坏了，下面重新生成 */
+  }
+  const identity = {
+    id: crypto.randomBytes(16).toString('hex'),
+    hostname: os.hostname(),
+    platform: process.platform,
+    created_at: Date.now() / 1000,
+  };
+  fs.mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(machineFile(), `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+  fs.chmodSync(machineFile(), 0o600);
+  return identity;
 }
 
 export function loadConfig() {
@@ -98,16 +128,39 @@ function openBrowser(url) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** RFC 8628 设备码登录：申请设备码 → 用户浏览器审批 → 轮询换 token → 落盘。 */
-export async function deviceLogin({ url, sharedToken, label, noBrowser = false, log = () => {} }) {
+/**
+ * RFC 8628 设备码登录：申请设备码 → 机器没在册就先让持 access code 的人批注册 →
+ * 发起人自己在设备授权页确认 → 轮询换 token → 落盘。
+ * 机器指纹随请求带上，服务端批过一次就一直记得，之后直接进设备授权那一段。
+ */
+export async function deviceLogin({ url, label, noBrowser = false, log = () => {} }) {
   const root = String(url).replace(/\/+$/, '');
-  const client = createClient({ baseUrl: root, token: sharedToken });
-  const code = await client.post('/oauth/device/code', {
-    body: { client_id: 'comfyui-cli', label },
-  });
+  const client = createClient({ baseUrl: root });
+  const me = machineIdentity();
+  const requestCode = () =>
+    client.post('/oauth/device/code', {
+      body: { client_id: me.id, hostname: me.hostname, platform: me.platform, label },
+    });
+
+  let code;
+  try {
+    code = await requestCode();
+  } catch (err) {
+    // 申请设备码是免鉴权端点，服务端按 IP 限流；撞上了就等它说的秒数再试一次
+    if (!(err instanceof ApiError) || err.status !== 429) throw err;
+    const wait = Math.max(1, Number(err.headers?.get?.('retry-after')) || 10);
+    log(`申请太频繁，${wait} 秒后重试…`);
+    await sleep(wait * 1000);
+    code = await requestCode();
+  }
 
   log('');
-  log(`请在浏览器里完成授权（用共享 token 批准）: ${code.verification_uri}`);
+  if (code.registration_required) {
+    log('这台机器还没登记，先让持有 access code 的人批准注册（批一次就够，之后不再需要）');
+    log(`  注册审批页: ${code.registration_uri}`);
+  } else {
+    log('这台机器已经登记过，直接确认设备即可');
+  }
   log(`  设备码: ${code.user_code}`);
   log(`  直达链接: ${code.verification_uri_complete}`);
   log('');
@@ -120,6 +173,7 @@ export async function deviceLogin({ url, sharedToken, label, noBrowser = false, 
   const intervalMs = Math.max(1, code.interval || 5) * 1000;
   const deadline = Date.now() + (code.expires_in || 600) * 1000;
   let slowDown = 0;
+  let waitingRegistration = false;
   while (Date.now() < deadline) {
     await sleep(intervalMs + slowDown * 1000);
     let data;
@@ -129,8 +183,21 @@ export async function deviceLogin({ url, sharedToken, label, noBrowser = false, 
       });
     } catch (err) {
       if (!(err instanceof ApiError)) throw err;
+      if (err.code === 'registration_pending') {
+        if (!waitingRegistration) {
+          waitingRegistration = true;
+          log(`等待注册审批…（${code.user_code}）`);
+          log(`  注册审批页: ${code.registration_uri}`);
+        }
+        continue;
+      }
       if (err.code === 'authorization_pending') {
-        log(`等待授权…（${code.user_code}，Ctrl-C 取消）`);
+        if (waitingRegistration) {
+          waitingRegistration = false;
+          log('注册已通过，请在浏览器里确认这次登录…');
+        } else {
+          log(`等待授权…（${code.user_code}，Ctrl-C 取消）`);
+        }
         continue;
       }
       if (err.code === 'slow_down') {

@@ -21,6 +21,7 @@ process.env.COMFYUI_CLI_CONFIG_DIR = emptyCfg;
 
 const { ApiError, UsageError, createClient } = await import('../src/api.js');
 const auth = await import('../src/auth.js');
+const update = await import('../src/update.js');
 const wf = await import('../src/workflow.js');
 
 after(() => {
@@ -41,6 +42,7 @@ const GRAPH = {
       seed: 0,
       steps: 20,
       cfg: 4,
+      denoise: 1,
       sampler_name: 'euler',
       model: ['4', 0],
       positive: ['6', 0],
@@ -49,6 +51,36 @@ const GRAPH = {
     },
   },
   8: { class_type: 'VAEDecode', inputs: { samples: ['3', 0], vae: ['4', 2] } },
+};
+
+// Qwen 模板的样子：正负提示词在同一个节点上，输入名是 prompt / negative_prompt
+const QWEN_GRAPH = {
+  1: { class_type: 'UnetLoaderGGUF', inputs: { unet_name: 'q.gguf' } },
+  4: {
+    class_type: 'TextEncodeQwenImage21',
+    inputs: {
+      clip: ['2', 0],
+      prompt: '模板默认的狐狸',
+      negative_prompt: '低质量',
+      resolution: 1024,
+    },
+  },
+  5: { class_type: 'EmptyLatentImage', inputs: { width: 1024, height: 1024, batch_size: 1 } },
+  6: {
+    class_type: 'KSampler',
+    inputs: {
+      model: ['1', 0],
+      positive: ['4', 0],
+      negative: ['4', 1],
+      latent_image: ['5', 0],
+      seed: 0,
+      steps: 20,
+      cfg: 1,
+      sampler_name: 'euler',
+      scheduler: 'simple',
+      denoise: 1,
+    },
+  },
 };
 
 describe('workflow: 解析与校验', () => {
@@ -117,11 +149,44 @@ describe('workflow: buildOverrides', () => {
     assert.equal(notes.length, 7);
   });
 
-  it('--set 解析 JSON 值，未知输入只提示不报错', () => {
-    const { overrides, notes } = wf.buildOverrides(GRAPH, { set: ['6.text="引号"', '3.denoise=0.5', '3.newkey=1'] });
+  it('Qwen 模板按节点实际输入名映射 prompt/negative_prompt', () => {
+    const { overrides } = wf.buildOverrides(QWEN_GRAPH, { prompt: '橡皮鸭', negative: '模糊' });
+    assert.deepEqual(overrides['4'], { prompt: '橡皮鸭', negative_prompt: '模糊' });
+  });
+
+  it('正负同节点时 negative 不会覆盖 prompt 键', () => {
+    const { overrides } = wf.buildOverrides(QWEN_GRAPH, { negative: '模糊' });
+    assert.deepEqual(overrides['4'], { negative_prompt: '模糊' });
+  });
+
+  it('节点没有可写的提示词输入 → 用法错误并列出可用输入', () => {
+    const graph = { 6: { class_type: 'KSampler', inputs: { steps: 1, seed: 0 } } };
+    assert.throws(
+      () => wf.buildOverrides(graph, { prompt: 'x' }),
+      (e) => e instanceof UsageError && /找不到提示词节点/.test(e.message),
+    );
+    const odd = { 9: { class_type: 'TextEncodeWhatever', inputs: { clip: ['1', 0] } } };
+    assert.throws(
+      () => wf.buildOverrides(odd, { prompt: 'x' }),
+      (e) => e instanceof UsageError && /找过 text\/prompt/.test(e.message) && /--set 9\./.test(e.message),
+    );
+  });
+
+  it('--set 解析 JSON 值', () => {
+    const { overrides } = wf.buildOverrides(GRAPH, { set: ['6.text="引号"', '3.denoise=0.5'] });
     assert.equal(overrides['6'].text, '引号');
     assert.equal(overrides['3'].denoise, 0.5);
-    assert.ok(notes.some((n) => /原本没有输入 newkey/.test(n)));
+  });
+
+  it('--set 输入名不在节点上 → 用法错误（写错的名字会被 ComfyUI 静默忽略）', () => {
+    assert.throws(
+      () => wf.buildOverrides(GRAPH, { set: ['3.newkey=1'] }),
+      (e) => e instanceof UsageError && /输入 newkey 不在节点 3/.test(e.message),
+    );
+    assert.throws(
+      () => wf.buildOverrides(GRAPH, { set: ['6.prompt=1'] }),
+      (e) => e instanceof UsageError && /可用: text, clip/.test(e.message),
+    );
   });
 
   it('--set 节点不存在 → 用法错误', () => {
@@ -301,16 +366,18 @@ describe('api: HTTP 客户端', () => {
   });
 });
 
+const runCliWith = async (env, ...args) => {
+  try {
+    const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...args], { env, timeout: 15_000 });
+    return { code: 0, stdout, stderr };
+  } catch (e) {
+    return { code: e.code, stdout: e.stdout, stderr: e.stderr };
+  }
+};
+
 describe('cli: 退出码与提示', () => {
   const env = { ...process.env, COMFYUI_CLI_CONFIG_DIR: emptyCfg };
-  const runCli = async (...args) => {
-    try {
-      const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...args], { env });
-      return { code: 0, stdout, stderr };
-    } catch (e) {
-      return { code: e.code, stdout: e.stdout, stderr: e.stderr };
-    }
-  };
+  const runCli = (...args) => runCliWith(env, ...args);
 
   it('--version → 0 且打印版本号', async () => {
     const r = await runCli('--version');
@@ -354,34 +421,32 @@ describe('cli: 退出码与提示', () => {
     assert.match(r.stderr, /comfyui login --url http:\/\/127\.0\.0\.1:8199/);
   });
 
-  it('login 没有共享 token（非交互）→ 2，不发设备码请求', async () => {
+  it('login 不再要求先给 token：连不上就是运行错误（退出码 1）', async () => {
     const bare = { ...env };
     delete bare.COMFYUI_CLI_TOKEN;
     delete bare.COMFYUI_API_TOKEN;
-    try {
-      await execFileAsync(process.execPath, [CLI, 'login', '--url', 'http://127.0.0.1:8199', '--no-browser'], { env: bare });
-      assert.fail('应该以用法错误退出');
-    } catch (e) {
-      assert.equal(e.code, 2);
-      assert.match(e.stderr, /发起登录需要共享 token/);
-    }
+    const r = await runCliWith(bare, 'login', '--url', 'http://127.0.0.1:8199', '--no-browser');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /连接被拒绝|请求失败/);
   });
 
-  it('login 带 --token 会真的去发起设备码', async () => {
-    const bare = { ...env };
-    delete bare.COMFYUI_CLI_TOKEN;
-    delete bare.COMFYUI_API_TOKEN;
-    try {
-      const { stderr } = await execFileAsync(
-        process.execPath,
-        [CLI, 'login', '--url', 'http://127.0.0.1:8199', '--token', 'shared-x', '--no-browser'],
-        { env: bare },
-      );
-      assert.fail(`不该成功：${stderr}`);
-    } catch (e) {
-      assert.equal(e.code, 1);
-      assert.match(e.stderr, /连接被拒绝|请求失败/);
-    }
+  it('login --token 直接把共享 token 存成凭据（不发设备码）', async () => {
+    const iso = path.join(tmpRoot, 'shared-login');
+    const r = await runCliWith(
+      { ...env, COMFYUI_CLI_CONFIG_DIR: iso },
+      'login',
+      '--url',
+      'http://shared:8199',
+      '--token',
+      'shared-x',
+      '--label',
+      'ci',
+    );
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /已登录/);
+    const cred = JSON.parse(fs.readFileSync(path.join(iso, 'auth.json'), 'utf8'));
+    assert.equal(cred.servers['http://shared:8199'].access_token, 'shared-x');
+    assert.equal(cred.servers['http://shared:8199'].scope, 'shared');
   });
 
   it('config --json 显示凭据路径与未登录状态', async () => {
@@ -396,5 +461,202 @@ describe('cli: 退出码与提示', () => {
     const r = await runCli('generate', '-t', 'x', '--seed', '-1', '--url', 'http://127.0.0.1:8199', '--token', 't');
     assert.equal(r.code, 1);
     assert.match(r.stderr, /请求失败|连接被拒绝/);
+  });
+
+  it('--no-wait 提交后立即返回，不轮询作业', async () => {
+    const polls = [];
+    const srv = http.createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      if (req.method === 'POST' && req.url === '/v1/jobs') {
+        res.writeHead(202);
+        res.end(JSON.stringify({ job_id: 'j1', status: 'queued', queue_position: 1, source: 'tpl' }));
+      } else if (req.url === '/v1/workflows/tpl') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ workflow: GRAPH }));
+      } else {
+        polls.push(req.url);
+        res.writeHead(200);
+        res.end(JSON.stringify({ job_id: 'j1', status: 'running' }));
+      }
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [CLI, 'generate', '-t', 'tpl', '--prompt', '雪山', '--no-wait', '--url', url, '--token', 'comfyui_t'],
+        { env, timeout: 8000 },
+      );
+      assert.match(stdout, /不等结果/);
+      assert.equal(polls.length, 0);
+    } finally {
+      srv.close();
+    }
+  });
+
+  it('login 走两段审批：等注册审批 → 等设备确认 → 拿到 token', async () => {
+    const polls = { n: 0 };
+    let codeBody = null;
+    const srv = http.createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      let raw = '';
+      req.on('data', (c) => {
+        raw += c;
+      });
+      req.on('end', () => {
+        if (req.url === '/oauth/device/code') {
+          codeBody = JSON.parse(raw);
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              device_code: 'd',
+              user_code: 'AAAA-BBBB',
+              registration_required: true,
+              verification_uri: `${url}/oauth/register?user_code=AAAA-BBBB`,
+              verification_uri_complete: `${url}/oauth/register?user_code=AAAA-BBBB`,
+              registration_uri: `${url}/oauth/register?user_code=AAAA-BBBB`,
+              device_uri: `${url}/oauth/device?user_code=AAAA-BBBB`,
+              interval: 1,
+              expires_in: 60,
+            }),
+          );
+        } else if (req.url === '/oauth/token') {
+          polls.n += 1;
+          if (polls.n === 1) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'registration_pending', error_description: '还没批注册' }));
+          } else if (polls.n === 2) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'authorization_pending', error_description: '还没确认设备' }));
+          } else {
+            res.writeHead(200);
+            res.end(
+              JSON.stringify({
+                access_token: 'comfyui_new',
+                token_type: 'Bearer',
+                token_id: 't1',
+                label: 'laptop',
+                scope: 'comfyui',
+                expires_in: 3600,
+              }),
+            );
+          }
+        } else {
+          res.writeHead(404);
+          res.end(JSON.stringify({ detail: 'Not Found' }));
+        }
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    const iso = path.join(tmpRoot, 'device-login');
+    try {
+      const { stdout } = await execFileAsync(process.execPath, [CLI, 'login', '--url', url, '--no-browser'], {
+        env: { ...env, COMFYUI_CLI_CONFIG_DIR: iso },
+        timeout: 15_000,
+      });
+      assert.match(stdout, /还没登记，先让持有 access code 的人批准注册/);
+      assert.match(stdout, /设备码: AAAA-BBBB/);
+      assert.match(stdout, /请手动打开/);
+      assert.match(stdout, /等待注册审批/);
+      assert.match(stdout, /注册已通过，请在浏览器里确认/);
+      assert.match(stdout, /已登录/);
+    } finally {
+      srv.close();
+    }
+    // 机器指纹随申请上报，服务端按它记住注册审批
+    assert.match(codeBody.client_id, /^[0-9a-f]{32}$/, JSON.stringify(codeBody));
+    assert.equal(codeBody.hostname, os.hostname());
+    const machine = JSON.parse(fs.readFileSync(path.join(iso, 'machine.json'), 'utf8'));
+    assert.equal(machine.id, codeBody.client_id);
+    assert.equal(fs.statSync(path.join(iso, 'machine.json')).mode & 0o777, 0o600);
+    // 再跑一次：同一个机器指纹（不重新生成）
+    const again = await execFileAsync(process.execPath, [CLI, 'config', '--json'], {
+      env: { ...env, COMFYUI_CLI_CONFIG_DIR: iso },
+    });
+    assert.equal(JSON.parse(again.stdout).machine_id, codeBody.client_id);
+  });
+});
+
+describe('update: 自更新', () => {
+  const pkgVersion = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8')).version;
+  let srv;
+  let registryVersion = '0.2.0';
+  let npmLog;
+  let env;
+
+  before(async () => {
+    srv = http.createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: registryVersion }));
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    npmLog = path.join(tmpRoot, 'npm.log');
+    const fakeBin = path.join(tmpRoot, 'fakebin');
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\necho "$@" >> "$NPM_LOG"\nexit 0\n', { mode: 0o755 });
+    env = {
+      ...process.env,
+      COMFYUI_CLI_CONFIG_DIR: emptyCfg,
+      COMFYUI_CLI_REGISTRY: `http://127.0.0.1:${srv.address().port}`,
+      NPM_LOG: npmLog,
+      PATH: `${fakeBin}:${process.env.PATH}`,
+    };
+  });
+
+  after(() => srv?.close());
+
+  const npmCalls = () =>
+    fs.existsSync(npmLog) ? fs.readFileSync(npmLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+
+  it('版本比较只看数字段', () => {
+    assert.equal(update.compareVersions('0.2.0', '0.1.9'), 1);
+    assert.equal(update.compareVersions('0.1.0', '0.1.0'), 0);
+    assert.equal(update.compareVersions('0.1.0', '0.10.0'), -1);
+    assert.equal(update.compareVersions('0.2.0-rc.1', '0.2.0'), 0);
+  });
+
+  it('从仓库跑的是开发副本', () => {
+    assert.equal(update.installKind(), 'dev');
+  });
+
+  it('开发副本只提示、不装', async () => {
+    const r = await runCliWith(env, 'update', '--json');
+    const info = JSON.parse(r.stdout);
+    assert.equal(r.code, 0);
+    assert.equal(info.update_available, true);
+    assert.equal(info.action, 'dev-copy');
+    assert.equal(info.install_kind, 'dev');
+    assert.deepEqual(npmCalls(), []);
+  });
+
+  it('--force 才真的调 npm 装指定版本', async () => {
+    const r = await runCliWith(env, 'update', '--json', '--force');
+    const info = JSON.parse(r.stdout);
+    assert.equal(info.action, 'install');
+    assert.equal(info.command, 'npm install -g comfyui-cli@0.2.0');
+    assert.deepEqual(npmCalls(), ['install -g comfyui-cli@0.2.0']);
+  });
+
+  it('registry 上就是当前版本 → 不装', async () => {
+    registryVersion = pkgVersion;
+    try {
+      const r = await runCliWith(env, 'update');
+      assert.equal(r.code, 0);
+      assert.match(r.stdout, new RegExp(`已是最新（${pkgVersion.replace(/\./g, '\\.')}）`));
+      assert.deepEqual(npmCalls(), ['install -g comfyui-cli@0.2.0']); // 还是上一条留下的那次
+    } finally {
+      registryVersion = '0.2.0';
+    }
+  });
+
+  it('registry 连不上 → 运行错误（退出码 1）', async () => {
+    const dead = http.createServer();
+    await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${dead.address().port}`;
+    await new Promise((resolve) => dead.close(resolve));
+    const r = await runCliWith({ ...env, COMFYUI_CLI_REGISTRY: url }, 'update', '--check');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /连不上 npm|请求失败/);
   });
 });

@@ -3,8 +3,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
-import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 
 import { ApiError, UsageError, createClient } from './api.js';
@@ -16,10 +14,22 @@ import {
   deviceLogin,
   isExpired,
   loadConfig,
+  machineFile,
+  machineIdentity,
   removeCredential,
   resolveToken,
   resolveUrl,
+  saveCredential,
 } from './auth.js';
+import {
+  PKG_NAME,
+  compareVersions,
+  installCommand,
+  installKind,
+  latestVersion,
+  registryUrl,
+  runInstall,
+} from './update.js';
 import {
   applyOverrides,
   assertApiFormat,
@@ -58,10 +68,11 @@ const HELP = `comfyui — ComfyUI 远程出图 CLI
 用法: comfyui <命令> [选项]
 
 登录与凭据
-  login [--token 共享token] OAuth 设备码登录（发起时要共享 token，省略则交互式输入），token 存本机
+  login [--label 名称] [--no-browser]  OAuth 设备码登录：没登记过的机器先过注册审批，token 存本机
+      --token <共享token>              直接用共享 token 当凭据（跳过设备码流程，兼容老脚本）
   logout [--all]            吊销当前 token 并删除本地凭据；--all 吊销该服务全部 token
   whoami                    当前凭据是谁（kind=shared|token、label、有效期）
-  config [--show]           显示服务地址、凭据文件与登录状态
+  config [--show]           显示服务地址、凭据文件、机器指纹与登录状态
 
 任务
   generate                  提交工作流出图（见下）
@@ -71,6 +82,7 @@ const HELP = `comfyui — ComfyUI 远程出图 CLI
 
 其它
   skill [-o 文件]           取服务端 /SKILL.md 调用说明
+  update [--check] [--force]  把自己更新到 npm 最新版（--check 只看版本）
   help | --version
 
 generate 选项
@@ -85,7 +97,12 @@ generate 选项
       --json                机器可读输出
 
 通用选项: --url <地址>  --token <token>  --help
-环境变量: COMFYUI_CLI_URL  COMFYUI_CLI_TOKEN  COMFYUI_API_TOKEN  COMFYUI_CLI_CONFIG_DIR
+环境变量: COMFYUI_CLI_URL  COMFYUI_CLI_TOKEN  COMFYUI_CLI_CONFIG_DIR
+
+登录流程（两段审批）
+  login 会打印一个链接：没登记过的机器先落到 /oauth/register，由持有 access code
+  （共享 token）的人批一次，批完自动跳到 /oauth/device，发起人自己确认即可。
+  机器指纹写在 ~/.config/comfyui/machine.json，批过一次就一直有效——下次登录直接确认设备。
 
 示例
   comfyui login --label 我的笔记本
@@ -125,11 +142,12 @@ function normalizeNegative(argv, extra) {
 }
 
 function parse(argv, extra = {}) {
+  // allowNegative 会把 --no-wait 吃成 wait=false，让这些开关静默失效，所以关掉它：
+  // --no-wait / --no-browser 就是普通布尔选项名
   const { values, positionals } = parseArgs({
     args: normalizeNegative(argv, extra),
     options: { ...BASE, ...extra },
     allowPositionals: true,
-    allowNegative: true,
   });
   for (const [key, value] of Object.entries(extra)) {
     if (value.type === 'string' && value.multiple !== true && values[key] === '') {
@@ -266,41 +284,6 @@ async function saveImages(client, job, outArg) {
 
 // ---- 子命令 ----
 
-/** 不回显地读一行：共享 token 不上屏，也不进 shell history。 */
-function askHidden(question) {
-  const mute = new Writable({ write(_chunk, _enc, cb) { cb(); } });
-  const rl = readline.createInterface({ input: process.stdin, output: mute, terminal: true });
-  err(question);
-  return new Promise((resolve) => {
-    rl.on('SIGINT', () => {
-      rl.close();
-      err('');
-      process.exit(EXIT.ERROR);
-    });
-    rl.question('', (answer) => {
-      rl.close();
-      err('');
-      resolve(answer.trim());
-    });
-  });
-}
-
-/**
- * 发起设备码要共享 token（服务端只认它）：--token > COMFYUI_CLI_TOKEN > COMFYUI_API_TOKEN >
- * 交互式隐藏输入。故意不看凭据文件——里面的设备 token 发起不了登录。
- */
-async function resolveSharedToken(values) {
-  const given = values.token?.trim() || process.env.COMFYUI_CLI_TOKEN?.trim() || process.env.COMFYUI_API_TOKEN?.trim();
-  if (given) return given;
-  if (!process.stdin.isTTY) {
-    throw new UsageError('发起登录需要共享 token：用 --token <共享 token>，或设 COMFYUI_CLI_TOKEN / COMFYUI_API_TOKEN');
-  }
-  err('发起登录需要共享 token（服务方线下发的那一枚，输入不回显）');
-  const answer = await askHidden('共享 token: ');
-  if (!answer) throw new UsageError('没有输入共享 token');
-  return answer;
-}
-
 async function cmdLogin(argv) {
   const { values } = parse(argv, {
     token: { type: 'string' },
@@ -309,14 +292,43 @@ async function cmdLogin(argv) {
   });
   const url = resolveUrl(values.url);
   const label = values.label?.trim() || os.hostname();
-  const shared = await resolveSharedToken(values);
-  const cred = await deviceLogin({ url, sharedToken: shared, label, noBrowser: values['no-browser'], log: (l) => out(l) });
-  if (values.json) {
-    out(JSON.stringify({ url: cred.url, token_id: cred.token_id, label: cred.label, expires_at: cred.expires_at }, null, 2));
+
+  // 给了共享 token 就直接当凭据存下来：不折腾设备码，老脚本也照跑
+  if (values.token?.trim()) {
+    const cred = {
+      access_token: values.token.trim(),
+      token_id: null,
+      label,
+      scope: 'shared',
+      created_at: Date.now() / 1000,
+      expires_at: null,
+    };
+    saveCredential(url, cred);
+    return reportLogin(url, cred, values.json);
+  }
+
+  const cred = await deviceLogin({
+    url,
+    label,
+    noBrowser: values['no-browser'],
+    log: (line) => out(line),
+  });
+  return reportLogin(url, cred, values.json);
+}
+
+function reportLogin(url, cred, asJson) {
+  if (asJson) {
+    out(
+      JSON.stringify(
+        { url, token_id: cred.token_id, label: cred.label, expires_at: cred.expires_at },
+        null,
+        2,
+      ),
+    );
     return EXIT.OK;
   }
-  out(`已登录 ${cred.url}`);
-  out(`  token_id: ${cred.token_id}   label: ${cred.label}`);
+  out(`已登录 ${url}`);
+  out(`  token_id: ${cred.token_id ?? '（共享 token，无 id）'}   label: ${cred.label}`);
   out(`  有效期至: ${fmtTime(cred.expires_at)}`);
   out(`  凭据文件: ${authFile()} (0600)`);
   return EXIT.OK;
@@ -568,6 +580,7 @@ async function cmdConfig(argv) {
       return null;
     }
   })();
+  const machine = machineIdentity();
   const info = {
     url,
     token_source: values.token ? 'flag' : source,
@@ -578,6 +591,8 @@ async function cmdConfig(argv) {
     config_dir: configDir(),
     auth_file: authFile(),
     auth_file_mode: mode,
+    machine_file: machineFile(),
+    machine_id: machine.id,
     known_servers: Object.keys(cfg.servers),
     default_server: cfg.default,
     default_url: DEFAULT_URL,
@@ -590,9 +605,60 @@ async function cmdConfig(argv) {
   out(`凭据文件: ${info.auth_file}${mode ? ` (mode ${mode})` : '（不存在）'}`);
   out(`已登录: ${info.logged_in ? `是，token ${info.token_id ?? ''} label ${info.label ?? '-'}，有效期至 ${fmtTime(info.expires_at)}` : '否'}`);
   out(`token 来源: ${info.token_source}`);
+  out(`机器指纹: ${info.machine_id}（服务端按它记住注册审批）`);
   if (info.known_servers.length > 1) out(`已知服务: ${info.known_servers.join(', ')}`);
   if (mode && mode !== '600') {
     err(`提示：凭据文件权限是 ${mode}，建议 chmod 600 ${info.auth_file}`);
+  }
+  return EXIT.OK;
+}
+
+/** 把 CLI 自己更新到 npm 上的最新版；开发副本默认只提示不动手。 */
+async function cmdUpdate(argv) {
+  const { values } = parse(argv, { check: { type: 'boolean' }, force: { type: 'boolean' } });
+  const current = version();
+  const latest = await latestVersion();
+  const newer = compareVersions(latest, current) > 0;
+  const kind = installKind();
+  const info = {
+    current,
+    latest,
+    update_available: newer,
+    install_kind: kind,
+    registry: registryUrl(),
+    action: 'none',
+    command: null,
+  };
+
+  const [cmd, args] = installCommand(kind, latest);
+  if (!newer) {
+    info.action = 'none';
+  } else if (values.check) {
+    info.action = 'check';
+    info.command = [cmd, ...args].join(' ');
+  } else if (kind === 'dev' && !values.force) {
+    info.action = 'dev-copy';
+  } else {
+    info.action = 'install';
+    info.command = [cmd, ...args].join(' ');
+    await runInstall(kind, latest);
+  }
+
+  if (values.json) {
+    out(JSON.stringify(info, null, 2));
+    return EXIT.OK;
+  }
+  if (!newer) {
+    out(`已是最新（${current}）`);
+    return EXIT.OK;
+  }
+  out(`有新版本：${current} → ${latest}`);
+  if (info.action === 'check') {
+    out(`执行更新：${info.command}`);
+  } else if (info.action === 'dev-copy') {
+    out('当前是开发链接（npm link）副本，请在仓库里更新；确实想装到全局就加 --force');
+  } else {
+    out(`已更新到 ${latest}（本进程仍是 ${current}，下次运行生效）`);
   }
   return EXIT.OK;
 }
@@ -607,6 +673,7 @@ const COMMANDS = {
   generate: cmdGenerate,
   skill: cmdSkill,
   config: cmdConfig,
+  update: cmdUpdate,
 };
 
 function isHelpRequest(argv) {

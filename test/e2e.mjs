@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-/** CLI 端到端：设备码登录（脚本代批）→ 出图落盘校验 → whoami/stats/jobs → 吊销 → 401
+/** CLI 端到端：两段审批登录（脚本代批注册 + 代确认设备）→ 出图落盘校验 → whoami/stats/jobs →
+ * 吊销 → 401 → 同一台机器再登录免注册审批。
  *
  * 用法: node test/e2e.mjs [--base http://127.0.0.1:8189] [--token 共享token]
  *                        [--steps 12] [--keep]
@@ -75,11 +76,11 @@ function cli(args) {
   });
 }
 
-/** 登录：起子进程等设备码，用共享 token 去授权页批准，再等它换到 token */
+/** 登录：起子进程等设备码，脚本按两段审批代批，再等它换到 token */
 async function loginThroughBrowser(label) {
   const child = spawn(
     process.execPath,
-    [CLI, 'login', '--url', BASE, '--token', TOKEN, '--label', label, '--no-browser'],
+    [CLI, 'login', '--url', BASE, '--label', label, '--no-browser'],
     { env },
   );
   let output = '';
@@ -92,8 +93,8 @@ async function loginThroughBrowser(label) {
     const m = /设备码: ([A-Z0-9-]+)/.exec(output);
     if (m) {
       output = output.replace(/设备码: [A-Z0-9-]+/, '设备码: <已用>'); // 只批一次
-      approve(m[1]).catch((e) => {
-        output += `\n批准失败: ${e.message}`;
+      approveTwoStages(m[1]).catch((e) => {
+        output += `\n审批失败: ${e.message}`;
       });
     }
   });
@@ -109,16 +110,29 @@ async function loginThroughBrowser(label) {
   return result;
 }
 
-async function approve(userCode) {
-  const body = new URLSearchParams({ user_code: userCode, token: TOKEN, action: 'approve' });
-  const res = await fetch(`${BASE}/oauth/device/approve`, {
+/** 两段审批：先拿 access code 批注册（303 跳设备授权页），再以发起人身份确认设备码 */
+async function approveTwoStages(userCode) {
+  const reg = await fetch(`${BASE}/oauth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
+    body: new URLSearchParams({ user_code: userCode, token: TOKEN, action: 'approve' }),
+    redirect: 'manual',
   });
-  const text = await res.text();
-  if (res.status !== 200) throw new Error(`授权页 HTTP ${res.status}: ${text.slice(0, 200)}`);
-  if (!/已授权/.test(text)) throw new Error(`授权页没批准成功: ${text.slice(0, 300)}`);
+  if (reg.status !== 303) {
+    throw new Error(`注册审批 HTTP ${reg.status}: ${(await reg.text()).slice(0, 200)}`);
+  }
+  const location = reg.headers.get('location') || '';
+  if (!location.includes(`/oauth/device?user_code=${userCode}`)) {
+    throw new Error(`注册审批没跳到设备页: ${location}`);
+  }
+  const dev = await fetch(`${BASE}/oauth/device/approve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ user_code: userCode, action: 'approve' }),
+  });
+  const text = await dev.text();
+  if (dev.status !== 200) throw new Error(`设备授权 HTTP ${dev.status}: ${text.slice(0, 200)}`);
+  if (!/已授权/.test(text)) throw new Error(`设备授权没批准成功: ${text.slice(0, 300)}`);
   return true;
 }
 
@@ -187,15 +201,10 @@ function checkPng(file) {
 
 const results = [];
 try {
-  title(`[1] 设备码登录（base=${BASE}）`);
-  const bare = await cli(['login', '--url', BASE, '--label', 'e2e', '--no-browser']);
-  ok(
-    bare.code === 2 && /共享 token/.test(bare.stderr),
-    '没给共享 token 就拒绝发起登录',
-    bare.stderr.trim().split('\n').at(-1),
-  );
+  title(`[1] 两段审批登录（base=${BASE}）`);
   const login = await loginThroughBrowser('e2e');
-  ok(login.code === 0, 'comfyui login 走完设备码流程', `exit=${login.code}`);
+  ok(login.code === 0, 'comfyui login 走完两段审批', `exit=${login.code}`);
+  ok(/还没登记，先让持有 access code 的人批准注册/.test(login.output), '新机器先要注册审批');
   ok(/已登录/.test(login.output), '打印登录结果');
 
   const authPath = path.join(cfgDir, 'auth.json');
@@ -259,6 +268,15 @@ try {
   const again = await cli(['whoami']);
   ok(again.code === 2 && /comfyui login/.test(again.stderr), '本地凭据已清，提示重新登录');
   ok(!fs.existsSync(authPath) || Object.keys(JSON.parse(fs.readFileSync(authPath, 'utf8')).servers).length === 0, '凭据文件里已无该服务');
+
+  title('[6] 记住批过的机器');
+  const relogin = await loginThroughBrowser('e2e-again');
+  ok(relogin.code === 0, '同一台机器再登录成功', `exit=${relogin.code}`);
+  ok(/这台机器已经登记过，直接确认设备/.test(relogin.output), '跳过注册审批（服务端按机器指纹记住）');
+  const reloginCred = JSON.parse(fs.readFileSync(authPath, 'utf8')).servers[BASE];
+  ok(reloginCred.access_token?.startsWith('comfyui_'), '又换到一枚可用 token', reloginCred.token_id);
+  const cleanup = await cli(['logout']);
+  ok(cleanup.code === 0 && /已吊销/.test(cleanup.stdout), '收尾吊销第二枚 token');
 } catch (err) {
   console.log(`\n失败：${err.message}`);
   if (process.env.COMFYUI_CLI_DEBUG) console.log(err.stack);
