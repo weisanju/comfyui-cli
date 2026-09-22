@@ -250,7 +250,8 @@ describe('auth: 凭据文件', () => {
     assert.equal(auth.resolveUrl('http://flag:1'), 'http://flag:1');
     assert.equal(auth.resolveUrl(), 'http://env:1');
     delete process.env.COMFYUI_CLI_URL;
-    assert.equal(auth.resolveUrl(), auth.DEFAULT_URL);
+    // 内置默认必须指向本机：公开仓库不内置任何具体部署的域名
+    assert.match(auth.resolveUrl(), /^http:\/\/127\.0\.0\.1:\d+$/);
     process.env.COMFYUI_CLI_CONFIG_DIR = emptyCfg;
   });
 

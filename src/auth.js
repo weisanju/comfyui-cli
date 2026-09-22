@@ -8,7 +8,8 @@ import { spawn } from 'node:child_process';
 
 import { ApiError, createClient } from './api.js';
 
-export const DEFAULT_URL = 'https://comfyui-api.weisanju.fun';
+/** 内置默认只指向本机自托管；连远程部署请显式 --url / COMFYUI_CLI_URL。 */
+export const DEFAULT_URL = 'http://127.0.0.1:8189';
 export const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 
 export function configDir() {

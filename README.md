@@ -4,8 +4,8 @@ ComfyUI 远程出图的命令行客户端。零运行时依赖（Node ≥ 22.5 �
 通过 **OAuth 设备码（两段审批）** 登录一次，token 存在本机用户目录，之后所有命令自动带上。
 
 - 面向 `comfyui-api`——ComfyUI 之上的 Bearer/OAuth 队列封装层（服务端不随本仓库开源）
-- 参考部署：`https://comfyui-api.weisanju.fun`（内置为默认地址；登录要服务方审批，
-  连别的部署用 `--url` / `COMFYUI_CLI_URL`）
+- 默认服务地址是**本机自托管** `http://127.0.0.1:8189`（0.1.4 起）；连远程部署用
+  `--url` / `COMFYUI_CLI_URL`，例如参考部署 `https://comfyui-api.weisanju.fun`（登录要服务方审批）
 - 典型链路：提交工作流 → 轮询 → 下载图片
 
 ## 安装
@@ -23,8 +23,11 @@ cd comfyui-cli && npm link
 
 ## 快速开始
 
+CLI 连的是自托管的 `comfyui-api`。不带 `--url` 时用**本机** `http://127.0.0.1:8189`；
+连远程部署显式给 `--url <你的服务地址>`（登录要服务方审批）。
+
 ```bash
-comfyui login --label 我的笔记本
+comfyui login --url <你的服务地址> --label 我的笔记本     # 本机部署可省略 --url
 # 终端打印设备码（如 4KPC-MKFK）与授权链接，并尝试打开浏览器
 comfyui generate -t qwen-image-2.1-t2i-gguf-api --prompt "雪山下的木屋，清晨薄雾" --steps 12
 # → comfyui-out/<job_id>-0.png
@@ -102,7 +105,7 @@ comfyui share 8f3c1a02-… --ttl 2d --json        # 机器可读
 
 ```
 分享链接（30m00s 内有效，到期自动失效）：
-  [0] https://comfyui-api.weisanju.fun/public/jobs/8f3c…/images/0?exp=1790088000&sig=…
+  [0] https://<你的服务地址>/public/jobs/8f3c…/images/0?exp=1790088000&sig=…
 ```
 
 - 链接带服务端 HMAC 签名与到期时间，**改一个字符就 403**，过期同样 403；
@@ -152,12 +155,12 @@ Qwen 系是 `prompt`/`negative_prompt`），所以内置模板与自带工作流
 
 | 变量 | 说明 |
 |---|---|
-| `COMFYUI_CLI_URL` | 服务地址（默认 `https://comfyui-api.weisanju.fun`） |
+| `COMFYUI_CLI_URL` | 服务地址（默认本机 `http://127.0.0.1:8189`） |
 | `COMFYUI_CLI_TOKEN` | 直接指定 token，跳过凭据文件（共享 token 或设备 token 都行） |
 | `COMFYUI_CLI_CONFIG_DIR` | 凭据与机器指纹目录（默认 `~/.config/comfyui`，测试用） |
 | `COMFYUI_CLI_REGISTRY` | `update` 的 registry（默认 `https://registry.npmjs.org`，国内可换镜像；`--registry` 可临时覆盖） |
 
-优先级：命令行 `--url/--token` > 环境变量 > 凭据文件 > 内置默认地址。
+优先级：命令行 `--url/--token` > 环境变量 > 凭据文件 > 内置默认地址（本机 `http://127.0.0.1:8189`）。
 
 ## 退出码
 

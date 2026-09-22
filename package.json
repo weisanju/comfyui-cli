@@ -1,6 +1,6 @@
 {
   "name": "comfyui-cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "ComfyUI 远程出图命令行客户端：OAuth 设备码登录（两段审批），凭据存在用户目录",
   "license": "MIT",
   "type": "module",

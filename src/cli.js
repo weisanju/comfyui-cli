@@ -101,6 +101,7 @@ generate 选项
 
 通用选项: --url <地址>  --token <token>  --help
 环境变量: COMFYUI_CLI_URL  COMFYUI_CLI_TOKEN  COMFYUI_CLI_CONFIG_DIR
+内置默认地址: ${DEFAULT_URL}（本机自托管；连远程部署用 --url / COMFYUI_CLI_URL）
 
 登录流程（两段审批）
   login 会打印一个链接：没登记过的机器先落到 /oauth/register，由持有 access code
@@ -755,6 +756,9 @@ export async function run(argv) {
         err(`token 无效或已吊销，重新执行：comfyui login --url ${resolveUrl()}`);
       } else {
         err(`请求失败${e.status ? `（HTTP ${e.status}）` : ''}：${e.detail}`);
+        if (e.status === 0 && e.url.startsWith(DEFAULT_URL)) {
+          err(`提示：内置默认地址是本机自托管 ${DEFAULT_URL}；连远程部署用 --url <地址> 或 COMFYUI_CLI_URL`);
+        }
       }
       code = EXIT.ERROR;
     } else if (e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION' || e?.code === 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE') {
