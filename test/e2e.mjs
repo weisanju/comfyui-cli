@@ -284,6 +284,11 @@ try {
   const relogin = await loginThroughBrowser('e2e-again');
   ok(relogin.code === 0, '同一台机器再登录成功', `exit=${relogin.code}`);
   ok(/这台机器已经登记过，直接确认设备/.test(relogin.output), '跳过注册审批（服务端按机器指纹记住）');
+  ok(
+    /直达链接: \S*\/oauth\/device\?user_code=/.test(relogin.output) && !/\/oauth\/register\?user_code=/.test(relogin.output),
+    '已注册机器直达设备授权页，不再给注册页',
+    (relogin.output.match(/直达链接: \S+/) || [''])[0],
+  );
   const reloginCred = JSON.parse(fs.readFileSync(authPath, 'utf8')).servers[BASE];
   ok(reloginCred.access_token?.startsWith('comfyui_'), '又换到一枚可用 token', reloginCred.token_id);
   const cleanup = await cli(['logout']);
