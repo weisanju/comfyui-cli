@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /** CLI 端到端：两段审批登录（脚本代批注册 + 代确认设备）→ 出图落盘校验 → whoami/stats/jobs →
- * 吊销 → 401 → 同一台机器再登录免注册审批。
+ * 吊销 → 401 → 同一台机器再登录免注册审批 → 收尾忘掉这台机器的注册记录。
  *
  * 用法: node test/e2e.mjs [--base http://127.0.0.1:8189] [--token 共享token]
  *                        [--steps 12] [--keep]
  *
  * 共享 token 取 --token、COMFYUI_API_TOKEN，或仓库根 .env（已在 .gitignore）。
- * 会生成真图（约 20s/张），结束时删掉临时凭据与图片（--keep 保留）。
+ * 会生成真图（约 20s/张），结束时删掉临时凭据与图片，并删掉服务端这台临时机器的
+ * 注册记录（--keep 只保留本地目录，注册记录照删）。
  */
 
 import assert from 'node:assert/strict';
@@ -134,6 +135,23 @@ async function approveTwoStages(userCode) {
   if (dev.status !== 200) throw new Error(`设备授权 HTTP ${dev.status}: ${text.slice(0, 200)}`);
   if (!/已授权/.test(text)) throw new Error(`设备授权没批准成功: ${text.slice(0, 300)}`);
   return true;
+}
+
+/** 忘掉这台机器（管理端等价于 `invoke clients --action forget`）；返回 HTTP 状态码 */
+async function forgetMachine(id) {
+  const res = await fetch(`${BASE}/v1/clients/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  return res.status;
+}
+
+async function clientRegistered(id) {
+  const res = await fetch(`${BASE}/v1/clients`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  const data = await res.json();
+  return (data.clients || []).some((c) => c.client_id === id);
 }
 
 /** 解析 PNG 并检查不是黑图/纯色（与 api/smoke_test.mjs 同一套判据） */
@@ -293,11 +311,23 @@ try {
   ok(reloginCred.access_token?.startsWith('comfyui_'), '又换到一枚可用 token', reloginCred.token_id);
   const cleanup = await cli(['logout']);
   ok(cleanup.code === 0 && /已吊销/.test(cleanup.stdout), '收尾吊销第二枚 token');
+
+  title('[8] 收尾：忘掉这台临时机器');
+  const machineId = JSON.parse(fs.readFileSync(path.join(cfgDir, 'machine.json'), 'utf8')).id;
+  ok((await forgetMachine(machineId)) === 200, '注册记录已删除（下次登录重走注册审批）', machineId.slice(0, 8));
+  ok(!(await clientRegistered(machineId)), '服务端注册表里不再有这台机器');
 } catch (err) {
   console.log(`\n失败：${err.message}`);
   if (process.env.COMFYUI_CLI_DEBUG) console.log(err.stack);
   process.exitCode = 1;
 } finally {
+  // 跑挂了也别把这台临时机器留在服务端；已删掉（404）算成功
+  try {
+    const machineFile = path.join(cfgDir, 'machine.json');
+    if (fs.existsSync(machineFile)) await forgetMachine(JSON.parse(fs.readFileSync(machineFile, 'utf8')).id);
+  } catch {
+    /* 收尾尽力而为，不掩盖真正的失败 */
+  }
   if (opts.keep) {
     console.log(`\n（--keep）临时目录保留在 ${workDir}`);
   } else {
