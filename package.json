@@ -1,0 +1,34 @@
+{
+  "name": "comfyui-cli",
+  "version": "0.1.0",
+  "description": "ComfyUI 远程出图命令行客户端：OAuth 设备码登录，凭据存在用户目录",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "comfyui": "bin/comfyui.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "e2e": "node test/e2e.mjs"
+  },
+  "keywords": [
+    "comfyui",
+    "cli",
+    "oauth",
+    "stable-diffusion",
+    "image-generation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weisanju/personal-architecture.git",
+    "directory": "deploy/comfyui/cli"
+  }
+}
